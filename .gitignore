@@ -1,3 +1,6 @@
 .DS_Store
 __pycache__
 .ipynb_checkpoints
+synthetic_bundle_20261009/
+synthesis_data/
+outputs/
