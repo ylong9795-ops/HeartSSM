@@ -15,18 +15,24 @@ from pathlib import Path
 import random
 import tempfile
 import time
+import math
+from collections import deque
+from functools import partial
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, default_collate
 import yaml
+from tqdm.auto import tqdm
 
 from data.mask_transform import CHAMBERS,VIEWS,MaskTransform
 from data.synthetic_4d import Synthetic4DDataset,_sha256
 from net.neural_ffdnet import NeuralFFDNet,ARCHITECTURE,geometry_digest
 from net.multiview_encoder import observation_validity
 from utils.neural_ffd_losses import NeuralFFDLoss,reconstruction_metrics
-from utils.slice_supervision import MeshSliceSupervisor,exact_section_mask
+from utils.slice_supervision import MeshSliceSupervisor
+from utils.slice_evaluation import render_source_slice,source_renderer_identity
+from utils.validation_runtime import ValidationRuntime,reference_signature
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 'neural-heartffd-checkpoint-v1'
@@ -69,12 +75,30 @@ def data_identity(config):
             ('train_manifest','val_manifest','asset_path','template_path')}
 
 
-def to_device(value,device):
+def to_device(value,device,non_blocking=False):
     if isinstance(value,torch.Tensor):
-        return value.to(device)
+        return value.to(device,non_blocking=non_blocking)
     if isinstance(value,dict):
-        return {key:to_device(item,device) for key,item in value.items()}
+        return {key:to_device(item,device,non_blocking) for key,item in value.items()}
     return value
+
+
+def training_collate(samples,stage):
+    """Exclude evaluation-only arrays before IPC and pinned-memory copies."""
+    unused = {'native_masks','model_to_native','native_pixel_spacing','clipped_foreground'}
+    if stage!='joint':
+        unused.update(('pose_gt','pixel_spacing'))
+    return default_collate([{key:value for key,value in sample.items() if key not in unused}
+                            for sample in samples])
+
+
+def training_loader(dataset,order,*,batch_size,workers,prefetch,device,generator,stage):
+    options = dict(batch_size=batch_size,num_workers=workers,generator=generator,
+                   collate_fn=partial(training_collate,stage=stage),
+                   pin_memory=torch.device(device).type=='cuda')
+    if workers:
+        options.update(multiprocessing_context='spawn',prefetch_factor=prefetch)
+    return DataLoader(Subset(dataset,order),**options)
 
 
 def build_model(dataset,config):
@@ -159,59 +183,105 @@ def compute_objective(model,batch,criterion,slicer,stage):
     return output,losses,slices
 
 
-def surface_metrics(predicted,truth,faces,samples=5000):
+def surface_metrics(predicted,truth,faces,samples=5000,reference_cache=None):
     """Deterministic sampled triangle-surface ASSD/HD95; no voxel conversion."""
     import trimesh
     from scipy.spatial import cKDTree
     p = trimesh.sample.sample_surface(trimesh.Trimesh(predicted,faces,process=False),samples,seed=2026)[0]
-    g = trimesh.sample.sample_surface(trimesh.Trimesh(truth,faces,process=False),samples,seed=2026)[0]
-    distances = np.concatenate((cKDTree(g).query(p)[0],cKDTree(p).query(g)[0]))
+    key = reference_signature((truth,faces,np.asarray(samples)))
+    cached = None if reference_cache is None else reference_cache.get(key)
+    if cached is None:
+        g = trimesh.sample.sample_surface(trimesh.Trimesh(truth,faces,process=False),samples,seed=2026)[0]
+        cached = (g,cKDTree(g))
+        if reference_cache is not None:
+            reference_cache[key] = cached
+    g,tree = cached
+    distances = np.concatenate((tree.query(p)[0],cKDTree(p).query(g)[0]))
     return dict(sampled_surface_assd_mm=float(distances.mean()),sampled_surface_hd95_mm=float(np.quantile(distances,.95)),surface_samples=samples)
 
 
-def boundary_metrics(prediction,truth,spacing):
+def boundary_reference(truth,spacing):
     from scipy.ndimage import binary_erosion
     from scipy.spatial import cKDTree
-    boundaries = [np.argwhere(x & ~binary_erosion(x)).astype(float)*spacing for x in (prediction.astype(bool),truth.astype(bool))]
-    p,g = boundaries
+    mask = truth.astype(bool)
+    points = np.argwhere(mask & ~binary_erosion(mask)).astype(float)*spacing
+    return points,cKDTree(points) if len(points) else None
+
+
+def boundary_metrics(prediction,truth,spacing,reference=None):
+    from scipy.ndimage import binary_erosion
+    from scipy.spatial import cKDTree
+    mask = prediction.astype(bool)
+    p = np.argwhere(mask & ~binary_erosion(mask)).astype(float)*spacing
+    g,tree = boundary_reference(truth,spacing) if reference is None else reference
     if not len(p) and not len(g):
         return dict(boundary_assd_mm=0.,boundary_hd95_mm=0.,empty_boundary='both')
     if not len(p) or not len(g):
         return dict(boundary_assd_mm=None,boundary_hd95_mm=None,empty_boundary='one')
-    distances = np.concatenate((cKDTree(g).query(p)[0],cKDTree(p).query(g)[0]))
+    distances = np.concatenate((tree.query(p)[0],cKDTree(p).query(g)[0]))
     return dict(boundary_assd_mm=float(distances.mean()),boundary_hd95_mm=float(np.quantile(distances,.95)),empty_boundary=None)
 
 
-def exact_metrics(model,predicted,batch):
-    """All available full-resolution phase/view/chamber cells; pose only here."""
+def exact_metrics(model,predicted,batch,reference_cache=None):
+    """Predicted mesh + original pose -> source renderer -> original-label Dice.
+
+    Rerendered GT must match the saved original native labels pixel-for-pixel.
+    Network-input resizing and canonical-FOV warps do not enter evaluation.
+    """
     p = predicted.detach().cpu().numpy()
     g = batch['vertices_gt'].cpu().numpy()
     pose = {k:v.cpu().numpy() for k,v in batch['pose_gt'].items()}
-    spacing = batch['pixel_spacing'].cpu().numpy()
-    masks = batch['masks'].cpu().numpy()
+    spacing = batch['native_pixel_spacing'].cpu().numpy()
+    native_masks = batch['native_masks'].cpu().numpy()
+    if (native_masks.shape[:4] != (len(p),p.shape[1],len(VIEWS),len(CHAMBERS))
+            or spacing.shape != (*native_masks.shape[:3],2)):
+        raise ValueError('Original native labels and native pixel spacing required for exact evaluation')
     valid = observation_validity(batch,len(p),p.shape[1],predicted.device).cpu().numpy()
+    faces = {c:model.faces[c].cpu().numpy() for c in CHAMBERS}
+    renderer = source_renderer_identity()
+    verified = {}
+    if reference_cache is not None:
+        signature = reference_signature((g,native_masks,spacing,valid,model.chamber_ranges.cpu().numpy(),
+            np.asarray(model.norm_to_mm),*pose.values(),*faces.values()),renderer)
+        if reference_cache.get('signature')!=signature:
+            reference_cache.clear()
+            reference_cache.update(signature=signature,cells={})
+        verified = reference_cache['cells']
     rows = []
     for patient,frame,view,chamber in np.argwhere(valid):
         c = CHAMBERS[chamber]
         left,right = model.chamber_ranges[chamber].tolist()
-        f = model.faces[c].cpu().numpy()
-        arguments = (f,pose['probe_R'][patient,frame,view],pose['probe_t'][patient,frame,view]*model.norm_to_mm,
-                     spacing[patient,frame,view],masks.shape[-2:])
-        pm = exact_section_mask(p[patient,frame,left:right],*arguments)
-        gm = exact_section_mask(g[patient,frame,left:right],*arguments)
-        target = masks[patient,frame,view,chamber]
+        f = faces[c]
+        arguments = (f,pose['probe_R'][patient,frame,view],pose['probe_t'][patient,frame,view],
+                     pose['probe_s'][patient,frame,view],model.norm_to_mm,native_masks.shape[-2:])
+        pm = render_source_slice(p[patient,frame,left:right],*arguments)
+        target = native_masks[patient,frame,view,chamber]
+        cell = (int(patient),int(frame),int(view),int(chamber))
+        reference = verified.get(cell)
+        if reference is None:
+            gm = render_source_slice(g[patient,frame,left:right],*arguments)
+            native_mismatch = int(np.count_nonzero(gm != target))
+            if native_mismatch:
+                raise ValueError(f'GT renderer/label mismatch: patient={patient}, frame={frame}, '
+                                 f'view={VIEWS[view]}, chamber={c}, native_pixels={native_mismatch}; '
+                                 'exact Dice evaluation rejected')
+            if reference_cache is not None:
+                reference = boundary_reference(target,spacing[patient,frame,view])
+                verified[cell] = reference
         def dice(a,b):
             mass = int(a.sum())+int(b.sum())
             return float(2*(a.astype(bool)&b.astype(bool)).sum()/mass) if mass else 1.
         rows.append(dict(patient=int(patient),frame=int(frame),view=VIEWS[view],chamber=c,
-            exact_dice=dice(pm,target),paired_exact_dice=dice(pm,gm),gt_saved_mask_dice=dice(gm,target),
-            **boundary_metrics(pm,target,spacing[patient,frame,view])))
+            exact_dice=dice(pm,target),paired_exact_dice=dice(pm,target),gt_saved_mask_dice=1.,
+            gt_native_pixel_mismatches=0,
+            **boundary_metrics(pm,target,spacing[patient,frame,view],reference)))
     values = np.array([r['exact_dice'] for r in rows])
     if not len(values):
         raise ValueError('No valid exact evaluation cells')
     summary = dict(cells=len(rows),mean_exact_dice=float(values.mean()),p05_exact_dice=float(np.quantile(values,.05)),
                    fraction_dice_ge_095=float((values>=.95).mean()),fraction_dice_ge_098=float((values>=.98).mean()),
-                   minimum_gt_saved_mask_dice=min(r['gt_saved_mask_dice'] for r in rows))
+                   minimum_gt_saved_mask_dice=min(r['gt_saved_mask_dice'] for r in rows),
+                   gt_native_pixel_mismatches=sum(r['gt_native_pixel_mismatches'] for r in rows))
     def group(selected):
         scores = np.array([r['exact_dice'] for r in selected])
         valid_distances = [r for r in selected if r['boundary_assd_mm'] is not None]
@@ -223,14 +293,62 @@ def exact_metrics(model,predicted,batch):
             missing_one_boundary_cells=sum(r['empty_boundary']=='one' for r in selected))
     summary['per_view'] = {v:group([r for r in rows if r['view']==v]) for v in VIEWS if any(r['view']==v for r in rows)}
     summary['per_chamber'] = {c:group([r for r in rows if r['chamber']==c]) for c in CHAMBERS if any(r['chamber']==c for r in rows)}
-    return dict(summary=summary,cells=rows)
+    return dict(renderer=renderer,summary=summary,cells=rows)
+
+
+def validation_summary(report):
+    """Pool squared errors with equal case/chamber weight; Dice by valid cell."""
+    metrics = [case['metrics'][c] for case in report['cases'] for c in CHAMBERS]
+    summary = {key:float(np.sqrt(np.mean([item[key]**2 for item in metrics]))) for key in
+               ('reference_vertex_rmse_mm','trajectory_vertex_rmse_mm','relative_motion_rmse_mm')}
+    summary['volume_mae_ml'] = float(np.mean([item['volume_mae_ml'] for item in metrics]))
+    exact = [case['exact']['summary'] for case in report['cases'] if 'exact' in case]
+    summary['mean_exact_dice'] = (sum(item['cells']*item['mean_exact_dice'] for item in exact)
+                                  /sum(item['cells'] for item in exact)) if exact else None
+    summary['validation_cases'] = report['case_count']
+    return summary
+
+
+def recover_epoch_loss(path,epoch,offset):
+    """Recover completed batches up to the checkpoint, ignoring later history.
+
+    A resumed run may append repeated offsets; use its latest record per offset.
+    Legacy histories have no batch_cases field, so infer it from adjacent offsets.
+    """
+    records = {}
+    if offset and Path(path).exists():
+        with Path(path).open() as stream:
+            for line in stream:
+                record = json.loads(line)
+                if record['epoch']==epoch and 0<record['sample_offset']<=offset:
+                    records[record['sample_offset']] = record
+    total,samples,previous = 0.,0,0
+    for end,record in sorted(records.items()):
+        size = record.get('batch_cases',end-previous)
+        total += record['total']*size
+        samples += size
+        previous = end
+    return total,samples
+
+
+def format_epoch_summary(record,epochs):
+    metrics = record['validation']
+    dice = 'n/a' if metrics['mean_exact_dice'] is None else f"{metrics['mean_exact_dice']:.4f}"
+    partial = ' (partial)' if not record['complete'] else ''
+    return (f"Epoch {record['epoch']}/{epochs} [{record['stage']}]{partial} | "
+            f"Train loss={record['train_mean_loss']:.4f} | "
+            f"Val Shape RMSE={metrics['reference_vertex_rmse_mm']:.3f} mm | "
+            f"Motion RMSE={metrics['relative_motion_rmse_mm']:.3f} mm | Dice={dice}")
 
 
 @torch.no_grad()
-def evaluate(model,dataset,device,*,cases,exact=False):
+def evaluate(model,dataset,device,*,cases,exact=False,progress=False,runtime=None):
     model.eval()
+    if runtime is not None:
+        return evaluate_with_runtime(model,dataset,device,cases=cases,exact=exact,progress=progress,runtime=runtime)
     rows = []
-    for index in range(min(cases,len(dataset))):
+    for index in tqdm(range(min(cases,len(dataset))),desc='Validation',leave=False,
+                      dynamic_ncols=True,mininterval=1.,disable=not progress):
         batch = to_device(next(iter(DataLoader(Subset(dataset,[index]),batch_size=1))),device)
         output = model(batch)
         metrics = reconstruction_metrics(output['vertices_4d'],batch['vertices_gt'],model.chamber_ranges,model.faces)
@@ -246,6 +364,59 @@ def evaluate(model,dataset,device,*,cases,exact=False):
                 motion_semantics='24 independent phases, sequential increments; closing gap is a true 1/24 step')
 
 
+def evaluate_with_runtime(model,dataset,device,*,cases,exact,progress,runtime):
+    start = time.perf_counter()
+    runtime.bind(model,dataset)
+    count = min(cases,len(dataset))
+    rows,pending = [],deque()
+    counters = dict(gt_cells_verified=0,gt_cells_reused=0)
+    compute_seconds,wait_seconds = 0.,0.
+    network_keys = ('masks','sdf','phases','view_present','annotated')
+    with tqdm(total=count,desc='Validation',leave=False,dynamic_ncols=True,
+              mininterval=1.,disable=not progress) as bar:
+        def finish():
+            nonlocal wait_seconds
+            item,future = pending.popleft()
+            t0 = time.perf_counter()
+            result = future.result()
+            wait_seconds += time.perf_counter()-t0
+            item['exact'] = result['exact']
+            for c in CHAMBERS:
+                item['metrics'][c].update(result['surfaces'][c])
+            for key in counters:
+                counters[key] += result[key]
+            rows.append(item)
+            bar.update()
+        for index,(batch,source,key) in runtime.batches(count):
+            t0 = time.perf_counter()
+            # Pose/native labels stay on CPU. Only network observations and
+            # the 3D GT needed by reconstruction_metrics reach CUDA.
+            observations = {key:to_device(value,device) if key in network_keys else value
+                            for key,value in batch.items()}
+            output = model(observations)
+            metrics = reconstruction_metrics(output['vertices_4d'],batch['vertices_gt'],model.chamber_ranges,model.faces)
+            item = dict(case_id=batch['case_id'][0],metrics=metrics)
+            if exact:
+                prediction = output['vertices_4d'].detach().cpu().numpy()
+                compute_seconds += time.perf_counter()-t0
+                pending.append((item,runtime.submit(index,prediction,source,key)))
+                if len(pending)>=runtime.max_pending:
+                    finish()
+            else:
+                compute_seconds += time.perf_counter()-t0
+                rows.append(item)
+                bar.update()
+            del output,observations
+        while pending:
+            finish()
+    return dict(cases=rows,case_count=len(rows),manifest_sha256=dataset.manifest_sha256,
+        reference_semantics='synthetic source frame 0; not independently selected clinical ED',
+        motion_semantics='24 independent phases, sequential increments; closing gap is a true 1/24 step',
+        performance=dict(seconds=time.perf_counter()-start,workers=runtime.workers,cache_cases=runtime.cache_cases,
+            input_cache_hits=runtime.input_hits,input_cache_misses=runtime.input_misses,
+            inference_and_3d_metrics_seconds=compute_seconds,cpu_wait_seconds=wait_seconds,**counters))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=ROOT/'configs/neural_ffd.yaml')
@@ -259,9 +430,22 @@ def main():
     parser.add_argument('--evaluate',type=Path)
     parser.add_argument('--split',choices=('val','test'),default='val')
     parser.add_argument('--exact',action='store_true')
+    parser.add_argument('--eval-workers',type=int,default=4,
+                        help='Spawned original-renderer CPU workers; 0 runs inline with caching')
+    parser.add_argument('--eval-cache-cases',type=int,default=32,
+                        help='Maximum cached preprocessed validation cases in host memory')
+    parser.add_argument('--train-workers',type=int,
+                        help='Override training reader workers without changing checkpoint configuration')
+    parser.add_argument('--train-prefetch',type=int,default=2,
+                        help='Prefetched batches per training reader worker')
     args = parser.parse_args()
+    if args.eval_workers<0 or args.eval_cache_cases<1:
+        parser.error('Evaluation workers must be nonnegative and cache size positive')
+    if (args.train_workers is not None and args.train_workers<0) or args.train_prefetch<1:
+        parser.error('Training reader workers must be nonnegative and prefetch positive')
     config,data_config = load_config(args.config)
     training = config['training']
+    reader_workers = training['workers'] if args.train_workers is None else args.train_workers
     device = args.device or training['device']
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
     torch.set_num_threads(training['cpu_threads'])
@@ -279,7 +463,9 @@ def main():
         if (model.template_sha256!=validation.template_sha256 or model.asset_sha256!=validation.asset_sha256
                 or model.norm_to_mm!=validation.norm_to_mm):
             raise ValueError('Evaluation dataset differs from checkpoint geometry')
-        report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],exact=args.exact)
+        with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator:
+            report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],
+                              exact=args.exact,progress=True,runtime=evaluator)
         report.update(checkpoint_sha256=_sha256(args.evaluate),split=args.split)
         (output_dir/'evaluation.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
         print('Evaluation saved:',output_dir/'evaluation.json',flush=True)
@@ -304,49 +490,87 @@ def main():
     count = min(args.max_cases or len(train),len(train))
     if offset<0 or offset>=count or epoch<0 or epoch>training['epochs']:
         raise ValueError('Checkpoint training position outside selected dataset')
-    with (output_dir/'history.jsonl').open('a') as history:
+    with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator, (output_dir/'history.jsonl').open('a') as history:
         while epoch<training['epochs']:
+            epoch_start = time.perf_counter()
             stage = args.stage or stage_for_epoch(epoch,config)
             generator = torch.Generator().manual_seed(training['seed']+epoch)
             order = torch.randperm(count,generator=generator).tolist()
-            loader = DataLoader(Subset(train,order[offset:]),batch_size=training['batch_size'],
-                                num_workers=training['workers'],generator=generator,
-                                multiprocessing_context='spawn' if training['workers'] else None)
+            loader = training_loader(train,order[offset:],batch_size=training['batch_size'],
+                workers=reader_workers,prefetch=args.train_prefetch,device=device,generator=generator,stage=stage)
             model.train()
-            for batch in loader:
-                start = time.perf_counter()
-                batch = to_device(batch,device)
-                optimizer.zero_grad(set_to_none=True)
-                decoded,losses,slices = compute_objective(model,batch,criterion,slicer,stage)
-                losses['total'].backward()
-                if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
-                    raise ValueError('Nonfinite network gradient')
-                optimizer.step()
-                offset += batch['masks'].shape[0]
-                step += 1
-                record = dict(epoch=epoch,step=step,sample_offset=offset,stage=stage,total=float(losses['total']),
-                    terms={key:float(value.detach()) for key,value in losses['terms'].items()},
-                    active_weights=losses['active_weights'],units=losses['units'],seconds=time.perf_counter()-start)
-                if slices is not None:
-                    record['slice_diagnostics'] = slices['diagnostics']
-                history.write(json.dumps(record,allow_nan=False)+'\n');history.flush()
-                print(f"epoch={epoch} step={step} stage={stage} loss={record['total']:.6f} seconds={record['seconds']:.2f}",flush=True)
-                next_epoch,next_offset = (epoch+1,0) if offset==count else (epoch,offset)
-                stopping = args.max_steps is not None and step>=args.max_steps
-                if stopping or step%training['checkpoint_every_steps']==0:
-                    save_checkpoint(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
-                        epoch=next_epoch,sample_offset=next_offset,step=step,runtime=runtime)
-                if stopping:
-                    report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],exact=args.exact)
-                    report.update(scope='limited engineering run; no formal performance claim',step=step)
-                    (output_dir/'validation.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
-                    return
-            epoch,offset = epoch+1,0
-            save_checkpoint(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
-                            epoch=epoch,sample_offset=offset,step=step,runtime=runtime)
-            report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],exact=args.exact)
-            report.update(epoch=epoch,step=step)
-            (output_dir/'validation.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+            loss_sum,loss_samples = recover_epoch_loss(output_dir/'history.jsonl',epoch,offset)
+            stopping = False
+            io_seconds,compute_seconds,processed_samples = 0.,0.,0
+            data_wait_start = time.perf_counter()
+            with tqdm(loader,total=math.ceil(count/training['batch_size']),
+                      initial=math.ceil(offset/training['batch_size']),
+                      desc=f"Epoch {epoch+1}/{training['epochs']} [{stage}]",
+                      dynamic_ncols=True,mininterval=1.,leave=False) as progress:
+                for batch in progress:
+                    start = time.perf_counter()
+                    io_wait = start-data_wait_start
+                    io_seconds += io_wait
+                    batch = to_device(batch,device,non_blocking=torch.device(device).type=='cuda')
+                    optimizer.zero_grad(set_to_none=True)
+                    decoded,losses,slices = compute_objective(model,batch,criterion,slicer,stage)
+                    losses['total'].backward()
+                    if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+                        raise ValueError('Nonfinite network gradient')
+                    optimizer.step()
+                    batch_cases = batch['masks'].shape[0]
+                    offset += batch_cases
+                    step += 1
+                    record = dict(epoch=epoch,step=step,sample_offset=offset,batch_cases=batch_cases,
+                        stage=stage,total=float(losses['total']),
+                        terms={key:float(value.detach()) for key,value in losses['terms'].items()},
+                        active_weights=losses['active_weights'],units=losses['units'],seconds=time.perf_counter()-start)
+                    record['io_wait_seconds'] = io_wait
+                    compute_seconds += record['seconds']
+                    processed_samples += batch_cases
+                    if slices is not None:
+                        record['slice_diagnostics'] = slices['diagnostics']
+                    history.write(json.dumps(record,allow_nan=False)+'\n');history.flush()
+                    loss_sum += record['total']*batch_cases
+                    loss_samples += batch_cases
+                    next_epoch,next_offset = (epoch+1,0) if offset==count else (epoch,offset)
+                    stopping = args.max_steps is not None and step>=args.max_steps
+                    if stopping or step%training['checkpoint_every_steps']==0:
+                        save_checkpoint(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
+                            epoch=next_epoch,sample_offset=next_offset,step=step,runtime=runtime)
+                    if stopping:
+                        break
+                    data_wait_start = time.perf_counter()
+            complete = offset==count
+            epoch_number = epoch+1
+            if complete:
+                epoch,offset = epoch+1,0
+            if not stopping:
+                save_checkpoint(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
+                                epoch=epoch,sample_offset=offset,step=step,runtime=runtime)
+            report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],
+                              exact=args.exact,progress=True,runtime=evaluator)
+            summary = dict(epoch=epoch_number,step=step,stage=stage,complete=complete,
+                train_mean_loss=loss_sum/loss_samples,train_samples=loss_samples,
+                validation=validation_summary(report),seconds=time.perf_counter()-epoch_start)
+            summary['validation_performance'] = report['performance']
+            summary['training_performance'] = dict(reader_workers=reader_workers,prefetch=args.train_prefetch,
+                processed_samples=processed_samples,io_wait_seconds=io_seconds,compute_seconds=compute_seconds,
+                timing_scope='current invocation segment; includes reader startup')
+            report.update(epoch=epoch_number,step=step,epoch_summary=summary)
+            if stopping:
+                report['scope'] = 'limited engineering run; no formal performance claim'
+            rendered_report = json.dumps(report,indent=2,allow_nan=False)+'\n'
+            (output_dir/'validation.json').write_text(rendered_report)
+            archive = output_dir/'validation'
+            archive.mkdir(exist_ok=True)
+            name = f'epoch_{epoch_number:04d}.json' if complete else f'partial_step_{step:08d}.json'
+            (archive/name).write_text(rendered_report)
+            with (output_dir/'epoch_history.jsonl').open('a') as epoch_history:
+                epoch_history.write(json.dumps(summary,allow_nan=False)+'\n')
+            tqdm.write(format_epoch_summary(summary,training['epochs']))
+            if stopping:
+                return
 
 
 if __name__=='__main__':

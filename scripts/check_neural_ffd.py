@@ -27,6 +27,7 @@ from train_neural_ffd import (load_config,dataset_from_config,load_checkpoint,to
                               compute_objective,exact_metrics)
 from utils.neural_ffd_losses import NeuralFFDLoss,mesh_volumes_ml,reconstruction_metrics
 from utils.slice_supervision import MeshSliceSupervisor,section_soft_mask,exact_section_mask
+from utils.slice_evaluation import render_source_slice
 
 
 def figures(model,trajectory,batch,destination):
@@ -34,8 +35,7 @@ def figures(model,trajectory,batch,destination):
     p = trajectory.detach().cpu().numpy()[0]
     g = batch['vertices_gt'].cpu().numpy()[0]
     poses = {k:v.cpu().numpy()[0] for k,v in batch['pose_gt'].items()}
-    spacing = batch['pixel_spacing'].cpu().numpy()[0]
-    masks = batch['masks'].cpu().numpy()[0]
+    masks = batch['native_masks'].cpu().numpy()[0]
     volumes = mesh_volumes_ml(trajectory[:1],model.chamber_ranges,model.faces).detach().cpu().numpy()[0]
     target_volumes = mesh_volumes_ml(batch['vertices_gt'][:1].to(trajectory),model.chamber_ranges,model.faces).cpu().numpy()[0]
     contraction = int(target_volumes[:,0].argmin())
@@ -65,13 +65,13 @@ def figures(model,trajectory,batch,destination):
             for chamber,(c,(left,right),color) in enumerate(zip(CHAMBERS,model.chamber_ranges.tolist(),colors)):
                 if not observation_validity(batch,len(batch['masks']),len(p),trajectory.device)[0,frame,view,chamber]:
                     continue
-                predicted = exact_section_mask(p[frame,left:right],model.faces[c].cpu().numpy(),
-                    poses['probe_R'][frame,view],poses['probe_t'][frame,view]*model.norm_to_mm,
-                    spacing[frame,view],masks.shape[-2:])
+                predicted = render_source_slice(p[frame,left:right],model.faces[c].cpu().numpy(),
+                    poses['probe_R'][frame,view],poses['probe_t'][frame,view],poses['probe_s'][frame,view],
+                    model.norm_to_mm,masks.shape[-2:])
                 target = masks[frame,view,chamber]
                 if target.any(): ax.contour(target,levels=[.5],colors=[color],linestyles='solid',linewidths=1)
                 if predicted.any(): ax.contour(predicted,levels=[.5],colors=[color],linestyles='dashed',linewidths=1)
-            ax.set_title(f'{VIEWS[view]} f{frame}: solid GT, dashed prediction');ax.axis('off')
+            ax.set_title(f'{VIEWS[view]} f{frame}: original grid; solid GT, dashed prediction');ax.axis('off')
     fig.tight_layout();fig.savefig(destination/'sections.png',dpi=140);plt.close(fig)
 
 
