@@ -33,6 +33,7 @@ from utils.neural_ffd_losses import NeuralFFDLoss,reconstruction_metrics
 from utils.slice_supervision import MeshSliceSupervisor
 from utils.slice_evaluation import render_source_slice,source_renderer_identity
 from utils.validation_runtime import ValidationRuntime,reference_signature
+from utils.encoder_diagnostics import EncoderDiagnostics
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 'neural-heartffd-checkpoint-v1'
@@ -344,8 +345,18 @@ def format_epoch_summary(record,epochs):
 @torch.no_grad()
 def evaluate(model,dataset,device,*,cases,exact=False,progress=False,runtime=None):
     model.eval()
-    if runtime is not None:
-        return evaluate_with_runtime(model,dataset,device,cases=cases,exact=exact,progress=progress,runtime=runtime)
+    with EncoderDiagnostics(model) as diagnostics:
+        if runtime is not None:
+            report = evaluate_with_runtime(model,dataset,device,cases=cases,exact=exact,progress=progress,runtime=runtime)
+        else:
+            report = evaluate_serial(model,dataset,device,cases=cases,exact=exact,progress=progress)
+        summary = diagnostics.summary()
+        if summary is not None:
+            report['encoder_diagnostics'] = summary
+        return report
+
+
+def evaluate_serial(model,dataset,device,*,cases,exact=False,progress=False):
     rows = []
     for index in tqdm(range(min(cases,len(dataset))),desc='Validation',leave=False,
                       dynamic_ncols=True,mininterval=1.,disable=not progress):
@@ -561,6 +572,8 @@ def main():
                 train_mean_loss=loss_sum/loss_samples,train_samples=loss_samples,
                 validation=validation_summary(report),seconds=time.perf_counter()-epoch_start)
             summary['validation_performance'] = report['performance']
+            if 'encoder_diagnostics' in report:
+                summary['encoder_diagnostics'] = report['encoder_diagnostics']
             summary['training_performance'] = dict(reader_workers=reader_workers,prefetch=args.train_prefetch,
                 processed_samples=processed_samples,io_wait_seconds=io_seconds,compute_seconds=compute_seconds,
                 timing_scope='current invocation segment; includes reader startup')
