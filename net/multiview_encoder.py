@@ -201,3 +201,96 @@ class MultiViewTemporalEncoder(nn.Module):
             # Bias-free projections keep this residual zero if frame 0 is absent.
             z_shape = z_shape + self.direct_shape_gain*self.direct_shape_projection(direct[:,0])
         return {'z_shape': z_shape, 'z_motion': self.motion_head(motion)}
+
+
+class EncoderDiagnostics:
+    """Observe existing forwards; never recompute CNN or transfer feature maps.
+
+    RMS is pooled over elements/cases, with direct contributions measured after
+    the fixed gains. Frame branches exclude absent frames. Shape branches include
+    every case; an absent reference contributes zero direct Shape residual.
+    """
+    def __init__(self, model):
+        self.encoder = getattr(model, 'encoder', None)
+        self.enabled = getattr(self.encoder, 'feature_transfer', None) == 'direct_residual_v1'
+        self.handles, self.squares, self.counts = [], {}, {}
+        self.valid_frames = self.observed_references = self.cases = 0
+        self.latent_sum = self.latent_square_sum = None
+
+    def _before_encoder(self, module, args):
+        batch = args[0]
+        b, t = batch['masks'].shape[:2]
+        valid = observation_validity(batch, b, t, module.view_embedding.device)
+        self.frame_valid = valid.any(-1).any(-1).reshape(-1)
+        self.reference_valid = valid[:,0].any(-1).any(-1)
+        # Counts are reduced on GPU and copied together at the end.
+        self.valid_frames = self.valid_frames + self.frame_valid.sum()
+        self.observed_references = self.observed_references + self.reference_valid.sum()
+
+    def _record(self, key, value, mask=None):
+        if not value.numel():
+            return
+        value = value.detach().float()
+        count = value.numel()
+        if mask is not None:
+            # Fixed-size reductions avoid GPU boolean indexing's dynamic shape
+            # synchronization. Only summary() transfers a few scalars to CPU.
+            value = torch.where(mask[...,None], value, 0.)
+            count = mask.sum()*value.shape[-1]
+        square = value.square().sum()
+        self.squares[key] = square if key not in self.squares else self.squares[key] + square
+        self.counts[key] = self.counts.get(key, 0) + count
+
+    def _frame_direct(self, module, args, value):
+        self._record('frame_direct', value*self.encoder.direct_frame_gain, self.frame_valid)
+
+    def _shape_direct(self, module, args, value):
+        self._record('shape_direct', value*self.encoder.direct_shape_gain)
+
+    def _after_encoder(self, module, args, output):
+        self._record('shape_latent', output['z_shape'])
+        # Float64 accumulation resolves near-constant latents without float32
+        # cancellation inflating an apparent between-case difference.
+        latent = output['z_shape'].detach().double()
+        total, squares = latent.sum(0), latent.square().sum(0)
+        self.latent_sum = total if self.latent_sum is None else self.latent_sum + total
+        self.latent_square_sum = squares if self.latent_square_sum is None else self.latent_square_sum + squares
+        self.cases += latent.shape[0]
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        self.handles.append(self.encoder.register_forward_pre_hook(self._before_encoder))
+        for key, module in (('frame_attention', self.encoder.frame_projection),
+                            ('shape_main', self.encoder.shape_head)):
+            self.handles.append(module.register_forward_hook(
+                lambda module,args,value,key=key:self._record(key,value)))
+        self.handles.append(self.encoder.time_projection.register_forward_hook(
+            lambda module,args,value:self._record('time_embedding', value.reshape(-1,value.shape[-1]), self.frame_valid)))
+        self.handles.append(self.encoder.direct_frame_projection.register_forward_hook(self._frame_direct))
+        self.handles.append(self.encoder.direct_shape_projection.register_forward_hook(self._shape_direct))
+        self.handles.append(self.encoder.register_forward_hook(self._after_encoder))
+        return self
+
+    def summary(self):
+        if not self.enabled or not self.cases:
+            return None
+        keys = list(self.squares)
+        variance = (self.latent_square_sum/self.cases-(self.latent_sum/self.cases).square()).clamp_min(0)
+        values = torch.stack([self.squares[k].double()/self.counts[k] for k in keys] +
+            [variance.mean(), self.valid_frames.double(), self.observed_references.double()]).cpu().tolist()
+        rms = {key:math.sqrt(value) for key,value in zip(keys, values)}
+        def ratio(numerator, denominator):
+            return rms[numerator]/rms[denominator] if rms[denominator] > 0 else None
+        return dict(feature_transfer=self.encoder.feature_transfer, cases=self.cases,
+            valid_frames=int(values[-2]), observed_reference_cases=int(values[-1]), rms=rms,
+            frame_direct_to_attention_ratio=ratio('frame_direct','frame_attention'),
+            shape_direct_to_main_ratio=ratio('shape_direct','shape_main'),
+            shape_latent_between_case_rms=math.sqrt(values[-3]) if self.cases > 1 else None,
+            rms_semantics='Element-pooled RMS; direct branches include fixed gains; absent frames excluded',
+            latent_spread_semantics='Population RMS deviation from cohort mean, not an accuracy metric')
+
+    def __exit__(self, *args):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()

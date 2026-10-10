@@ -1,0 +1,36 @@
+# Diagnostic split of the existing 1K cohort: 800 train / 100 val / 100 test.
+# Paths are relative to the HeartSSM repository root, not the shell cwd.
+# Immutable source manifests are rebound in memory by an explicit prefix map.
+data:
+  train_manifest: synthesis_data/anatomical_per_sample_production1000_neural_splits_v1/train.json
+  val_manifest: synthesis_data/anatomical_per_sample_production1000_neural_splits_v1/validation.json
+  test_manifest: synthesis_data/anatomical_per_sample_production1000_neural_splits_v1/test.json
+  asset_path: synthesis_data/original_ssm_v1/asset.json
+  path_map:
+    /mnt/nas1/disk07/yilong/whole_heart/echo_gsf_4ch/outputs/synthesis_data: synthesis_data
+  template_path: synthetic_bundle_20261009/outputs/s1_repository_cleanup/initialization.pth
+  template_file_sha256: 8b3a6a0f443df42ee2b8338df9656970963eb86496ad9784753b5620aa4dbd46
+  views: [A2C, A3C, A4C]
+  chambers: [LV, LA, RV, RA]
+  expected_phases: 24
+  remove_duplicate_endpoint: true
+  phase_semantics: relative_observed_cycle_time
+mask:
+  target_size: 224
+  # Recorded fixed physical widths from EchoGSF configs/data/synthetic_dev_1k.yaml,
+  # commit 157aa7624cfda8e7319ec325af5d1088065f026d. Not fit to production TEST.
+  # Any foreground outside this FOV raises; native-grid mode uses null FOV.
+  canonical_fov_mm: {A2C: 231.902, A3C: 226.07, A4C: 209.037}
+  use_sdf: true
+  sdf_clip_mm: 15.0
+  sdf_normalize: false
+  allow_clipping: false
+check:
+  verify_source_hash: true
+  verify_topology: true
+  sample_count: 16
+  batch_workers: 2
+  output: outputs/neural_ffd_1k_data_check
+  # Cumulative sequential native-reader milestones, without SDF/warp repetition.
+  # TEST is read only for explicit full-cohort data integrity/throughput checks.
+  benchmark_sizes: [100, 1000]

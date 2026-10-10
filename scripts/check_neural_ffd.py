@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import statistics
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
@@ -24,7 +26,7 @@ from data.mask_transform import CHAMBERS,VIEWS
 from net.neural_ffdnet import geometry_digest
 from net.multiview_encoder import observation_validity
 from train_neural_ffd import (load_config,dataset_from_config,load_checkpoint,to_device,
-                              compute_objective,exact_metrics)
+                              compute_objective,exact_metrics,training_collate)
 from utils.neural_ffd_losses import NeuralFFDLoss,mesh_volumes_ml,reconstruction_metrics
 from utils.slice_supervision import MeshSliceSupervisor,section_soft_mask,exact_section_mask
 from utils.slice_evaluation import render_source_slice
@@ -75,13 +77,104 @@ def figures(model,trajectory,batch,destination):
     fig.tight_layout();fig.savefig(destination/'sections.png',dpi=140);plt.close(fig)
 
 
+def benchmark_joint(args):
+    """Time TRAIN loss/gradient paths without updating the model or reading TEST."""
+    if args.cases<1 or args.repeats<1 or min(args.cell_chunks)<1:
+        raise ValueError('Positive cases, repeats and cell chunks required')
+    if torch.device(args.device).type!='cuda':
+        raise ValueError('This timing harness requires CUDA')
+    torch.set_num_threads(4)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    config,data_config = load_config(args.config)
+    print('Loading TRAIN and checkpoint; no optimizer updates.',flush=True)
+    dataset = dataset_from_config(data_config)
+    model,saved = load_checkpoint(args.checkpoint,args.device)
+    if (model.template_sha256!=dataset.template_sha256 or model.asset_sha256!=dataset.asset_sha256
+            or model.norm_to_mm!=dataset.norm_to_mm):
+        raise ValueError('Checkpoint and dataset geometry differ')
+    model.train()
+    criterion = NeuralFFDLoss(model.chamber_ranges,model.faces,**config['loss']).to(args.device)
+    slicers = [('serial',MeshSliceSupervisor(model.chamber_ranges,model.faces,model.norm_to_mm,
+                                           **config['slice']).to(args.device))]
+    slicers += [(f'batched_{chunk}',MeshSliceSupervisor(model.chamber_ranges,model.faces,model.norm_to_mm,
+        **config['slice'],execution_backend='batched',cell_chunk_size=chunk).to(args.device))
+        for chunk in args.cell_chunks]
+    rows = []
+    for case in range(min(args.cases,len(dataset))):
+        batch = to_device(training_collate([dataset[case]],'joint'),args.device)
+        with torch.no_grad():
+            prediction = model(batch)['vertices_4d'].detach()
+        reference_loss,reference_grad = None,None
+        for name,slicer in slicers:
+            forward,backward,total = [],[],[]
+            peak = 0
+            for iteration in range(args.repeats+1):
+                vertices = prediction.clone().requires_grad_()
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                start = time.perf_counter()
+                result = slicer(vertices,batch)
+                torch.cuda.synchronize()
+                middle = time.perf_counter()
+                result['total'].backward()
+                torch.cuda.synchronize()
+                end = time.perf_counter()
+                if iteration:
+                    forward.append(middle-start);backward.append(end-middle);total.append(end-start)
+                    peak = max(peak,torch.cuda.max_memory_allocated())
+            losses = {key:float(result[key]) for key in ('total','dice','bce','boundary_mm')}
+            if reference_loss is None:
+                reference_loss,reference_grad = losses,vertices.grad.detach().clone()
+            row = dict(case_id=batch['case_id'][0],execution=name,
+                slice_forward_seconds=statistics.mean(forward),slice_backward_seconds=statistics.mean(backward),
+                slice_total_seconds=statistics.mean(total),peak_allocated_mib=peak/2**20,
+                losses=losses,diagnostics=result['diagnostics'],
+                max_loss_abs_difference=max(abs(losses[k]-reference_loss[k]) for k in losses),
+                gradient_relative_l2_difference=float((vertices.grad-reference_grad).norm()/reference_grad.norm().clamp_min(1e-30)),
+                gradient_max_abs_difference=float((vertices.grad-reference_grad).abs().max()))
+            rows.append(row)
+            print(json.dumps(row),flush=True)
+            del vertices,result
+        # Include the existing CNN checkpointing and 3D losses in complete-step timing.
+        for name,slicer in (slicers[0],slicers[1+args.cell_chunks.index(16)] if 16 in args.cell_chunks else slicers[-1]):
+            timings=[]
+            for iteration in range(args.repeats+1):
+                model.zero_grad(set_to_none=True)
+                torch.cuda.synchronize();torch.cuda.reset_peak_memory_stats()
+                start = time.perf_counter()
+                output,losses,slices = compute_objective(model,batch,criterion,slicer,'joint')
+                losses['total'].backward()
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter()-start
+                if iteration:timings.append(elapsed)
+                del output,losses,slices
+            row = dict(case_id=batch['case_id'][0],execution=name,
+                joint_forward_backward_seconds=statistics.mean(timings),
+                joint_peak_allocated_mib=torch.cuda.max_memory_allocated()/2**20)
+            rows.append(row);print(json.dumps(row),flush=True)
+        del batch,prediction,reference_grad
+    report = dict(scope='Engineering timing/loss/gradient check on TRAIN; no optimizer updates or accuracy claim',
+        gpu=torch.cuda.get_device_name(),cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
+        checkpoint=str(args.checkpoint),checkpoint_step=saved['step'],repeats=args.repeats,rows=rows)
+    args.output.parent.mkdir(parents=True,exist_ok=True)
+    args.output.write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint',type=Path,required=True)
     parser.add_argument('--config',type=Path,default=ROOT/'configs/neural_ffd.yaml')
     parser.add_argument('--device',default='cpu')
     parser.add_argument('--output',type=Path,default=ROOT/'outputs/neural_ffd_check')
+    parser.add_argument('--benchmark-joint',action='store_true')
+    parser.add_argument('--cases',type=int,default=2)
+    parser.add_argument('--repeats',type=int,default=3)
+    parser.add_argument('--cell-chunks',type=int,nargs='+',default=[8,16,32])
     args = parser.parse_args()
+    if args.benchmark_joint:
+        benchmark_joint(args)
+        return
     torch.set_num_threads(4)
     config,data_config = load_config(args.config)
     dataset = dataset_from_config(data_config)

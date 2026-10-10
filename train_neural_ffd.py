@@ -28,12 +28,11 @@ from tqdm.auto import tqdm
 from data.mask_transform import CHAMBERS,VIEWS,MaskTransform
 from data.synthetic_4d import Synthetic4DDataset,_sha256
 from net.neural_ffdnet import NeuralFFDNet,ARCHITECTURE,geometry_digest
-from net.multiview_encoder import observation_validity
+from net.multiview_encoder import observation_validity,EncoderDiagnostics
 from utils.neural_ffd_losses import NeuralFFDLoss,reconstruction_metrics
 from utils.slice_supervision import MeshSliceSupervisor
 from utils.slice_evaluation import render_source_slice,source_renderer_identity
 from utils.validation_runtime import ValidationRuntime,reference_signature
-from utils.encoder_diagnostics import EncoderDiagnostics
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 'neural-heartffd-checkpoint-v1'
@@ -449,11 +448,17 @@ def main():
                         help='Override training reader workers without changing checkpoint configuration')
     parser.add_argument('--train-prefetch',type=int,default=2,
                         help='Prefetched batches per training reader worker')
+    parser.add_argument('--slice-backend',choices=('serial','batched'),default='batched',
+                        help='Equivalent differentiable slice execution; batched groups cells on GPU')
+    parser.add_argument('--slice-cell-chunk',type=int,default=16,
+                        help='Maximum section cells per batched slice group; controls temporary GPU memory')
     args = parser.parse_args()
     if args.eval_workers<0 or args.eval_cache_cases<1:
         parser.error('Evaluation workers must be nonnegative and cache size positive')
     if (args.train_workers is not None and args.train_workers<0) or args.train_prefetch<1:
         parser.error('Training reader workers must be nonnegative and prefetch positive')
+    if args.slice_cell_chunk<1:
+        parser.error('Slice cell chunk must be positive')
     config,data_config = load_config(args.config)
     training = config['training']
     reader_workers = training['workers'] if args.train_workers is None else args.train_workers
@@ -504,7 +509,8 @@ def main():
         optimizer.load_state_dict(saved['optimizer'])
         restore_rng(saved,device)
     criterion = NeuralFFDLoss(model.chamber_ranges,model.faces,**config['loss']).to(device)
-    slicer = MeshSliceSupervisor(model.chamber_ranges,model.faces,model.norm_to_mm,**config['slice']).to(device)
+    slicer = MeshSliceSupervisor(model.chamber_ranges,model.faces,model.norm_to_mm,**config['slice'],
+        execution_backend=args.slice_backend,cell_chunk_size=args.slice_cell_chunk).to(device)
     count = min(args.max_cases or len(train),len(train))
     if offset<0 or offset>=count or epoch<0 or epoch>training['epochs']:
         raise ValueError('Checkpoint training position outside selected dataset')
@@ -533,21 +539,26 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     decoded,losses,slices = compute_objective(model,batch,criterion,slicer,stage)
                     losses['total'].backward()
-                    if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+                    finite_gradients = [torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None]
+                    if finite_gradients and not torch.stack(finite_gradients).all():
                         raise ValueError('Nonfinite network gradient')
                     optimizer.step()
                     batch_cases = batch['masks'].shape[0]
                     offset += batch_cases
                     step += 1
+                    term_keys = list(losses['terms'])
+                    loss_scalars = torch.stack([losses['total'].detach()]+
+                        [losses['terms'][key].detach() for key in term_keys]).cpu().tolist()
                     record = dict(epoch=epoch,step=step,sample_offset=offset,batch_cases=batch_cases,
-                        stage=stage,total=float(losses['total']),
-                        terms={key:float(value.detach()) for key,value in losses['terms'].items()},
+                        stage=stage,total=loss_scalars[0],
+                        terms=dict(zip(term_keys,loss_scalars[1:])),
                         active_weights=losses['active_weights'],units=losses['units'],seconds=time.perf_counter()-start)
                     record['io_wait_seconds'] = io_wait
                     compute_seconds += record['seconds']
                     processed_samples += batch_cases
                     if slices is not None:
                         record['slice_diagnostics'] = slices['diagnostics']
+                        record['slice_execution'] = dict(backend=args.slice_backend,cell_chunk_size=args.slice_cell_chunk)
                     history.write(json.dumps(record,allow_nan=False)+'\n');history.flush()
                     loss_sum += record['total']*batch_cases
                     loss_samples += batch_cases
@@ -575,6 +586,7 @@ def main():
             if 'encoder_diagnostics' in report:
                 summary['encoder_diagnostics'] = report['encoder_diagnostics']
             summary['training_performance'] = dict(reader_workers=reader_workers,prefetch=args.train_prefetch,
+                slice_backend=args.slice_backend,slice_cell_chunk=args.slice_cell_chunk,
                 processed_samples=processed_samples,io_wait_seconds=io_seconds,compute_seconds=compute_seconds,
                 timing_scope='current invocation segment; includes reader startup')
             report.update(epoch=epoch_number,step=step,epoch_summary=summary)

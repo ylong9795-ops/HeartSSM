@@ -8,10 +8,11 @@ import torch
 from scipy.interpolate import BSpline
 
 from utils.ffd_physical import bspline_ffd_physical, control_geometry
-from net.multiview_encoder import MultiViewTemporalEncoder
+from net.multiview_encoder import MultiViewTemporalEncoder,EncoderDiagnostics
 from net.neural_ffdnet import NeuralFFDNet
 from utils.slice_supervision import (plane_segments,signed_segment_distance,section_soft_mask,
-                                     exact_section_mask,MissingSectionError,MeshSliceSupervisor)
+                                     exact_section_mask,MissingSectionError,MeshSliceSupervisor,
+                                     batched_plane_segments,batched_signed_segment_distance)
 from utils.neural_ffd_losses import NeuralFFDLoss
 
 
@@ -221,6 +222,38 @@ def observations(batch=2, frames=4, side=32):
 
 
 class EncoderTests(NeuralTestCase):
+    def test_integrated_diagnostics_preserve_latents_and_release_hooks(self):
+        from types import SimpleNamespace
+        torch.set_num_threads(2)
+        net = MultiViewTemporalEncoder(shape_dim=12,motion_dim=4,width=16,heads=2,
+            temporal_layers=1,spatial_sides=(4,2),query_slots=2,feature_transfer='direct_residual_v1').eval()
+        x = observations()
+        x['view_present'] = x['view_present'][:,None].repeat(1,4,1)
+        x['annotated'] = x['annotated'][:,None].repeat(1,4,1,1)
+        x['view_present'][0,0] = False
+        x['annotated'][0,0] = False
+        with torch.no_grad():
+            baseline = net(x)
+            with EncoderDiagnostics(SimpleNamespace(encoder=net)) as monitor:
+                measured = net(x)
+                summary = monitor.summary()
+        for key in baseline:
+            self.assertTrue(torch.equal(baseline[key],measured[key]))
+        self.assertEqual(summary['valid_frames'],7)
+        self.assertEqual(summary['observed_reference_cases'],1)
+        self.assertEqual(summary['cases'],2)
+        self.assertGreater(summary['rms']['shape_direct'],0.)
+        self.assertTrue(all(np.isfinite(value) for value in summary['rms'].values()))
+        for module in net.modules():
+            self.assertFalse(module._forward_hooks)
+            self.assertFalse(module._forward_pre_hooks)
+        x['phases'] = x['phases'].roll(1,1)
+        with self.assertRaises(ValueError), EncoderDiagnostics(SimpleNamespace(encoder=net)):
+            net(x)
+        for module in net.modules():
+            self.assertFalse(module._forward_hooks)
+            self.assertFalse(module._forward_pre_hooks)
+
     def test_latents_spatial_scales_and_gt_independence(self):
         torch.set_num_threads(2)
         net = MultiViewTemporalEncoder(shape_dim=12, motion_dim=4, width=16, heads=2,
@@ -302,6 +335,103 @@ class PhysicalFFDTests(NeuralTestCase):
         for bad_v, bad_c in ((v - 4, c), (v + 4, c), (v, c[:1]), (v*float('nan'), c)):
             with self.assertRaises(ValueError):
                 bspline_ffd_physical(bad_v, bad_c, torch.zeros(3), torch.ones(3))
+
+
+class BatchedSliceTests(unittest.TestCase):
+    def setUp(self):
+        import trimesh
+        torch.set_num_threads(2)
+        mesh = trimesh.creation.icosphere(subdivisions=1,radius=2.)
+        self.vertices = torch.tensor(mesh.vertices.copy(),dtype=torch.double)
+        self.faces = torch.tensor(mesh.faces.copy())
+
+    @classmethod
+    def tearDownClass(cls):
+        torch.set_num_threads(1)
+
+    def test_packed_distances_and_vertex_gradients_equal_independent_sections(self):
+        v = self.vertices[None].repeat(3,1,1).requires_grad_()
+        r = torch.eye(3,dtype=torch.double)[None].repeat(3,1,1)
+        tr = torch.tensor([[0.,0.,.31],[.17,-.23,.72],[0.,0.,10.]],dtype=torch.double)
+        points = torch.tensor([[.13,.29],[1.73,.53],[-1.17,-2.31]],dtype=torch.double)[None].repeat(3,1,1)
+        segments,present = batched_plane_segments(v,self.faces,r,tr)
+        self.assertFalse(present[2].any())
+        for chunk in (1,8):
+            batched = batched_signed_segment_distance(points,segments,present,chunk)[:2]
+            serial = torch.stack([signed_segment_distance(points[i],plane_segments(v[i],self.faces,r[i],tr[i]),chunk)
+                                  for i in range(2)])
+            torch.testing.assert_close(batched,serial,atol=1e-12,rtol=1e-12)
+            bg = torch.autograd.grad(batched.square().sum(),v,retain_graph=True)[0]
+            sg = torch.autograd.grad(serial.square().sum(),v,retain_graph=True)[0]
+            torch.testing.assert_close(bg,sg,atol=1e-11,rtol=1e-11)
+
+    def fixture(self):
+        b,t,h = 2,3,32
+        ranges = torch.tensor([[i*len(self.vertices),(i+1)*len(self.vertices)] for i in range(4)])
+        centers = torch.tensor([[-3.,-3.,0.],[-3.,3.,0.],[3.,-3.,0.],[3.,3.,0.]],dtype=torch.double)
+        mesh = (self.vertices[None]+centers[:,None]).reshape(-1,3)
+        trajectory = mesh[None,None].repeat(b,t,1,1)
+        trajectory[1,...,0] += .23
+        trajectory[:,1:,:,1] += .17
+        r = torch.eye(3,dtype=torch.double)[None,None,None].repeat(b,t,3,1,1)
+        angle = .13
+        r[:,:,1] = torch.tensor([[1.,0.,0.],[0.,np.cos(angle),-np.sin(angle)],
+                               [0.,np.sin(angle),np.cos(angle)]],dtype=torch.double)
+        tr = torch.zeros(b,t,3,3,dtype=torch.double)
+        tr[...,2] = .31
+        tr[1,2,2,2] = 20.  # valid empty/empty sections
+        spacing = torch.full((b,t,3,2),.625,dtype=torch.double)
+        spacing[:,:,1,0] = .7  # anisotropic physical pixel grid
+        valid = torch.ones(b,t,3,4,dtype=torch.bool)
+        valid[:,1,0] = False  # fully absent frame/view
+        valid[0,0,1,2:] = False  # chamber-specific missing observations
+        masks = torch.zeros(b,t,3,4,h,h,dtype=torch.double)
+        faces = dict(zip(('LV','LA','RV','RA'),[self.faces]*4))
+        for patient,frame,view,chamber in valid.nonzero().tolist():
+            left,right = ranges[chamber]
+            masks[patient,frame,view,chamber] = torch.tensor(exact_section_mask(
+                trajectory[patient,frame,left:right].numpy(),self.faces.numpy(),
+                r[patient,frame,view].numpy(),tr[patient,frame,view].numpy(),
+                spacing[patient,frame,view].numpy(),(h,h)),dtype=torch.double)
+        observations = dict(masks=masks,sdf=torch.full_like(masks,2.7),annotated=valid,
+            view_present=valid.any(-1),phases=torch.arange(t,dtype=torch.double)[None].repeat(b,1)/t,
+            pose_gt=dict(probe_R=r,probe_t=tr/2.5),pixel_spacing=spacing)
+        predicted = trajectory+torch.tensor([.11,-.07,.02],dtype=torch.double)
+        return predicted,observations,ranges,faces
+
+    def test_supervisor_losses_gradients_and_diagnostics_equal_with_empty_and_missing_cells(self):
+        predicted,obs,ranges,faces = self.fixture()
+        serial = MeshSliceSupervisor(ranges,faces,2.5,sigma_mm=.4,pixel_stride=2,chunk_size=31)
+        v = predicted.clone().requires_grad_()
+        original = serial(v,obs)
+        grad = torch.autograd.grad(original['total'],v)[0]
+        self.assertGreater(grad.norm().item(),0.)
+        self.assertEqual(original['diagnostics']['matched_empty_sections'],4)
+        for chunk in (1,5,128):
+            fast = MeshSliceSupervisor(ranges,faces,2.5,sigma_mm=.4,pixel_stride=2,chunk_size=31,
+                                       execution_backend='batched',cell_chunk_size=chunk)
+            vb = predicted.clone().requires_grad_()
+            result = fast(vb,obs)
+            self.assertEqual(result['diagnostics'],original['diagnostics'])
+            for key in ('total','dice','bce','boundary_mm'):
+                torch.testing.assert_close(result[key],original[key],atol=1e-11,rtol=1e-11)
+            bg = torch.autograd.grad(result['total'],vb)[0]
+            torch.testing.assert_close(bg,grad,atol=1e-11,rtol=1e-10)
+
+    def test_batched_backend_preserves_invalid_supervision_errors(self):
+        predicted,obs,ranges,faces = self.fixture()
+        fast = MeshSliceSupervisor(ranges,faces,2.5,pixel_stride=2,execution_backend='batched')
+        obs['masks'][1,2,2,0,4,4] = 1
+        with self.assertRaises(MissingSectionError):
+            fast(predicted,obs)
+        obs['masks'].zero_()
+        obs['masks'][0,0,0,0,1,1] = 1
+        with self.assertRaisesRegex(ValueError,'pixel_stride misses'):
+            fast(predicted,obs)
+        obs['masks'].zero_()
+        obs['pose_gt']['probe_R'][0,0,0,0,0] = 2
+        with self.assertRaisesRegex(ValueError,'orthonormal'):
+            fast(predicted,obs)
 
 
 if __name__ == '__main__':
