@@ -466,8 +466,15 @@ def main():
         with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator:
             report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],
                               exact=args.exact,progress=True,runtime=evaluator)
-        report.update(checkpoint_sha256=_sha256(args.evaluate),split=args.split)
+        report.update(checkpoint_sha256=_sha256(args.evaluate),split=args.split,
+                      summary=validation_summary(report))
         (output_dir/'evaluation.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
+        summary = report['summary']
+        dice = f"{summary['mean_exact_dice']:.4f}" if summary['mean_exact_dice'] is not None else 'n/a'
+        print(f"Evaluation [{args.split}] {report['case_count']} cases | "
+              f"Shape RMSE {summary['reference_vertex_rmse_mm']:.3f} mm | "
+              f"Motion RMSE {summary['relative_motion_rmse_mm']:.3f} mm | "
+              f"Dice {dice} | Volume MAE {summary['volume_mae_ml']:.3f} mL",flush=True)
         print('Evaluation saved:',output_dir/'evaluation.json',flush=True)
         return
     train = dataset_from_config(data_config)

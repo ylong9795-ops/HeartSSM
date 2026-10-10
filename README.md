@@ -34,6 +34,26 @@ are rebuilt after restart; `--eval-workers 0` runs cached evaluation inline.
 Worker/cache options do not change the checkpoint's model/training configuration.
 Epoch records include reader wait and validation cache/timing measurements.
 
+For a diagnostic run on the existing **1K** cohort, use:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 bash scripts/train_neural_ffd_1k.sh
+```
+
+The script prepares reproducible case-level **800 train / 100 validation / 100
+test** manifests without modifying source NPZ files, QC, poses or labels.
+It uses `configs/neural_ffd_1k.yaml`: 30 epochs (3 shape, 5 motion, 22 joint),
+the original model/loss settings, four training readers and four evaluation
+workers. Each epoch evaluates the same 32 validation cases; after training,
+the final checkpoint is evaluated on all 100 validation and 100 test cases.
+The test holdout is for this fresh diagnostic run; this cohort also has a
+historical 900/100 pilot split. Start with a fresh model/output directory;
+the full-cohort checkpoint has a different data/config identity.
+Override `RUN_OUTPUT` or `HEARTFFD_PYTHON` through environment variables if needed.
+Outputs include `epoch_history.jsonl`, `history.jsonl`, `last.pth`,
+`final_val/evaluation.json` and `final_test/evaluation.json`; evaluation JSON
+contains aggregate, case, chamber, view and phase-level measurements and timings.
+
 See [implementation and validation](docs/neural_ffd.rst),
 [public-source review](docs/neural_ffd_sources.json), and
 [configuration](configs/neural_ffd.yaml). Architecture checks do not establish
