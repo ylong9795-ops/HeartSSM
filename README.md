@@ -16,8 +16,12 @@ image size and source label renderer, then compares directly with the saved
 original native labels. Evaluation performs no image warp or resampling.
 The first GT check rejects any saved-label pixel mismatch; subsequent epochs
 reuse verified GT only while its source, pose, topology and renderer match.
-This requires the original `synthetic_bundle_20261009/data_generation/core.py`;
-the differentiable training losses are unchanged.
+`utils/slice_evaluation.py` pins the original `section_mask` function recorded
+by the existing 1K generation plan (core SHA256 `4bd081a4...`). Its
+`mesh.section` endpoint merging must not be replaced by the later bundled
+topological-endpoint renderer: rare sections differ by a pixel. Prediction and
+GT verification use the same original function; labels and differentiable
+training losses are unchanged. Reports record the generator and function hashes.
 
 Training uses tqdm progress bars and prints one compact summary after each
 epoch's validation: mean training loss, validation shape/motion RMSE (mm),
@@ -53,6 +57,40 @@ The CLI defaults to the validated batched slice backend with 16 cells per group.
 The source-file preparation prints a progress bar before training begins.
 Outputs include `epoch_history.jsonl`, `history.jsonl`, `last.pth`,
 `final_val/evaluation.json` and `final_test/evaluation.json`.
+
+For a longer fresh run on physical GPU 7, use the same launcher:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 TRAIN_PROFILE=long \
+RUN_OUTPUT="outputs/neural_ffd_1k_long_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)" \
+bash scripts/train_neural_ffd_1k_direct.sh
+```
+
+The long profile writes its effective configuration to the new output folder,
+using the same 800/100/100 split and architecture. It allocates **30 shape,
+30 shape+motion, and 120 joint epochs**. Shape supervision remains active in
+motion and joint; the reference path is not frozen. Adam uses 1e-4 during both
+pretraining stages; joint cosine decay starts at 1e-4 and ends at 1e-5.
+The rate is derived from the epoch, including on resume. All 100 validation
+cases are evaluated every epoch and cached with a 100-case host cache.
+Epoch terminal output retains the existing full-cycle Dice format; reference
+frame Dice and learning rate are recorded in JSON only.
+
+Long runs retain `last.pth`, `best_shape.pth`, `best_motion.pth`, `best_joint.pth`
+and `best_dice.pth`, plus their validation scores in `best_metrics.json`.
+The shape checkpoint minimizes reference RMSE. Motion and joint checkpoints
+minimize `sqrt(reference_RMSE^2 + relative_motion_RMSE^2)`, so cancellation of
+shape and motion errors in the predicted trajectory cannot improve this score.
+The separate joint Dice checkpoint maximizes exact full-cycle Dice. Final
+100-case validation and test evaluation use **best_joint.pth**, selected only
+on validation geometry. A larger epoch budget does not establish convergence;
+inspect the separate reference/motion validation trends. The launcher rejects
+output folders that already contain training history or a final checkpoint.
+No additional source config or launcher files are needed for this profile.
+To resume a long run in its existing folder, set `TRAIN_PROFILE=long`,
+`RUN_OUTPUT` to that folder and `RESUME_CHECKPOINT` to its `last.pth`.
+The launcher reuses the saved config, appends the terminal log, and still
+evaluates the validation-selected joint checkpoint after training completes.
 
 `configs/neural_ffd_1k_direct.yaml` enables `feature_transfer: direct_residual_v1`.
 The existing layer2/layer3 projected CNN maps are each pooled to 2x2, flattened

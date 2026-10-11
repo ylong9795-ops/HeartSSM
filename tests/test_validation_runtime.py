@@ -84,6 +84,21 @@ class ValidationRuntimeTests(unittest.TestCase):
         self.data = FixtureDataset()
         self.model = FixtureModel(self.data)
 
+    def test_renderer_matches_recorded_generation_symbol(self):
+        from utils.slice_evaluation import source_renderer_identity
+        identity = source_renderer_identity()
+        self.assertEqual(identity['generation_core_sha256'],
+            '4bd081a41efeed061959df89752e9afa79e7bb82c39833af128d7ad1ce4182b5')
+        self.assertEqual(identity['section_mask_sha256'],
+            '3ae51014042ec4abb82f138e80c0dc3ed326d53050fc22a454ed4847ca6003e1')
+        batch = default_collate([self.data[0]])
+        # The later topology-preserving renderer must never replace the
+        # original generator for prediction or GT consistency checks.
+        with patch('synthetic_bundle_20261009.data_generation.core.section_mask',
+                   side_effect=AssertionError('Wrong generation version')):
+            report = exact_metrics(self.model,self.model(batch)['vertices_4d'].detach(),batch)
+        self.assertEqual(report['summary']['gt_native_pixel_mismatches'],0)
+
     def test_cached_gt_halves_render_calls_without_changing_metrics(self):
         batch = default_collate([self.data[0]])
         prediction = self.model(batch)['vertices_4d'].detach()

@@ -1,28 +1,62 @@
 """Evaluation directly on original labels with their source renderer and pose.
 
-This module is never used by the differentiable training objective. It calls
-the original data-generation function, including its endpoint assembly,
-normalization, s+1e-8 projection, int32 truncation, clipping and fillPoly.
+This module is never used by the differentiable training objective. The 1K
+generation plan pins core.py to 4bd081a4..., whose section_mask is copied here
+verbatim. The later bundled core uses topological endpoint assembly and can
+disagree with the existing labels; it must not replace the recorded generator.
 """
 import hashlib
 import inspect
 
 import numpy as np
+import cv2
+import trimesh
 
 
-EVALUATION_POLICY = 'source-native-fillpoly-original-label-v2'
+EVALUATION_POLICY = 'source-native-fillpoly-original-label-v3-generation-v1'
+GENERATION_CORE_SHA256 = '4bd081a41efeed061959df89752e9afa79e7bb82c39833af128d7ad1ce4182b5'
+
+
+def section_mask(vertices: np.ndarray, faces: np.ndarray, R: np.ndarray, t: np.ndarray,
+                 s: np.ndarray, image_size: int = 224) -> np.ndarray:
+    """Rasterise one chamber section using the exact LV ``trimesh + fillPoly`` core.
+
+    This is intentionally copied from ``LV_only/search_probe_real.py`` with
+    only the Dice-specific ground-truth lines removed.
+    """
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    normal = R[:, 2]
+    origin = t
+    try:
+        section = mesh.section(plane_origin=origin, plane_normal=normal)
+    except Exception:
+        return np.zeros((image_size, image_size), dtype=np.uint8)
+    if section is None or len(section.vertices) < 3:
+        return np.zeros((image_size, image_size), dtype=np.uint8)
+
+    vert3d = section.vertices.astype(np.float64)
+    local = (vert3d - t[None, :]) @ R
+    px = (local[:, 0] / (s[0] + 1e-8) + 1.0) * 0.5 * image_size
+    py = (local[:, 1] / (s[1] + 1e-8) + 1.0) * 0.5 * image_size
+
+    img = np.zeros((image_size, image_size), dtype=np.uint8)
+    for entity in section.entities:
+        if len(entity.points) < 3:
+            continue
+        pts = np.stack([px[entity.points], py[entity.points]], axis=-1).astype(np.int32)
+        pts[:, 0] = np.clip(pts[:, 0], 0, image_size - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, image_size - 1)
+        cv2.fillPoly(img, [pts], 255)
+    return (img > 127).astype(np.uint8)
 
 
 def source_renderer_identity():
-    from synthetic_bundle_20261009.data_generation import core
-    import cv2
-    import trimesh
     return dict(policy=EVALUATION_POLICY, evaluation_grid='original_native', target='native_masks',
                 libraries=dict(numpy=np.__version__,opencv=cv2.__version__,trimesh=trimesh.__version__),
-                renderer='synthetic_bundle_20261009.data_generation.core.section_mask',
-                section_assembly=core.SECTION_ASSEMBLY_VERSION,
-                section_mask_sha256=hashlib.sha256(inspect.getsource(core.section_mask).encode()).hexdigest(),
-                section_path_sha256=hashlib.sha256(inspect.getsource(core.section_path).encode()).hexdigest())
+                renderer='utils.slice_evaluation.section_mask',
+                generation_core_sha256=GENERATION_CORE_SHA256,
+                section_assembly='original-trimesh-mesh-section-merged-endpoints-v1',
+                section_mask_sha256=hashlib.sha256(inspect.getsource(section_mask).encode()).hexdigest())
 
 
 def render_source_slice(vertices_mm, faces, rotation, translation_normalized,
@@ -32,8 +66,6 @@ def render_source_slice(vertices_mm, faces, rotation, translation_normalized,
     Only convert physical vertices back to source coordinate units. There is
     no image resampling, pose adjustment or reference to network-input masks.
     """
-    from synthetic_bundle_20261009.data_generation.core import section_mask
-
     vertices = np.asarray(vertices_mm, dtype=np.float64)
     rotation = np.asarray(rotation)
     translation = np.asarray(translation_normalized)

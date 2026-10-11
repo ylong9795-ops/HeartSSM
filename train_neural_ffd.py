@@ -57,6 +57,10 @@ def load_config(path):
             or min(training['shape_epochs'],training['motion_epochs'],training['workers'])<0
             or training['shape_epochs']+training['motion_epochs']>=training['epochs']):
         raise ValueError('Positive training dimensions and at least one final joint epoch required')
+    if (not math.isfinite(training['learning_rate']) or training['learning_rate']<=0
+            or ('joint_min_learning_rate' in training and
+                not 0<training['joint_min_learning_rate']<=training['learning_rate'])):
+        raise ValueError('Positive learning rate and joint minimum no greater than base rate required')
     return config,data_config
 
 
@@ -174,6 +178,33 @@ def stage_for_epoch(epoch,config):
     return 'joint'
 
 
+def learning_rate_for_epoch(epoch,config,stage):
+    """Constant warmup rates, optional joint cosine decay; resume needs no state."""
+    training = config['training']
+    base = training['learning_rate']
+    minimum = training.get('joint_min_learning_rate')
+    if stage!='joint' or minimum is None:
+        return base
+    start = training['shape_epochs']+training['motion_epochs']
+    duration = training['epochs']-start
+    fraction = min(1.,max(0.,(epoch-start)/max(1,duration-1)))
+    return minimum+(base-minimum)*(1+math.cos(math.pi*fraction))/2
+
+
+def best_checkpoint_candidates(summary):
+    """Select paired shape/motion errors before they can cancel in trajectories."""
+    if not summary['complete']:
+        return {}
+    metrics,stage = summary['validation'],summary['stage']
+    reference,motion = metrics['reference_vertex_rmse_mm'],metrics['relative_motion_rmse_mm']
+    score = reference if stage=='shape' else math.hypot(reference,motion)
+    candidates = {'best_'+stage:dict(score=score,criterion=(
+        'reference_vertex_rmse_mm' if stage=='shape' else 'sqrt(reference_rmse_mm^2+relative_motion_rmse_mm^2)'))}
+    if stage=='joint' and metrics['mean_exact_dice'] is not None:
+        candidates['best_dice'] = dict(score=-metrics['mean_exact_dice'],criterion='negative_mean_exact_dice')
+    return candidates
+
+
 def compute_objective(model,batch,criterion,slicer,stage):
     output = model(batch)
     slices = slicer(output['vertices_4d'],batch) if stage=='joint' else None
@@ -262,7 +293,9 @@ def exact_metrics(model,predicted,batch,reference_cache=None):
             gm = render_source_slice(g[patient,frame,left:right],*arguments)
             native_mismatch = int(np.count_nonzero(gm != target))
             if native_mismatch:
-                raise ValueError(f'GT renderer/label mismatch: patient={patient}, frame={frame}, '
+                identities = batch.get('case_id',())
+                case_id = identities[patient] if identities else 'unknown'
+                raise ValueError(f'GT renderer/label mismatch: case_id={case_id}, patient={patient}, frame={frame}, '
                                  f'view={VIEWS[view]}, chamber={c}, native_pixels={native_mismatch}; '
                                  'exact Dice evaluation rejected')
             if reference_cache is not None:
@@ -305,6 +338,10 @@ def validation_summary(report):
     exact = [case['exact']['summary'] for case in report['cases'] if 'exact' in case]
     summary['mean_exact_dice'] = (sum(item['cells']*item['mean_exact_dice'] for item in exact)
                                   /sum(item['cells'] for item in exact)) if exact else None
+    reference_cells = [cell for case in report['cases'] if 'exact' in case
+                       for cell in case['exact']['cells'] if cell['frame']==0]
+    summary['reference_exact_dice'] = (float(np.mean([cell['exact_dice'] for cell in reference_cells]))
+                                      if reference_cells else None)
     summary['validation_cases'] = report['case_count']
     return summary
 
@@ -504,6 +541,7 @@ def main():
         epoch,offset,step = saved['epoch'],saved['sample_offset'],saved['step']
     else:
         model = build_model(train,config).to(device)
+    (output_dir/'config.yaml').write_text(yaml.safe_dump(config,sort_keys=False))
     optimizer = torch.optim.Adam(model.parameters(),lr=training['learning_rate'])
     if args.resume:
         optimizer.load_state_dict(saved['optimizer'])
@@ -514,10 +552,16 @@ def main():
     count = min(args.max_cases or len(train),len(train))
     if offset<0 or offset>=count or epoch<0 or epoch>training['epochs']:
         raise ValueError('Checkpoint training position outside selected dataset')
+    best_path = output_dir/'best_metrics.json'
+    best = json.loads(best_path.read_text()) if args.resume and best_path.exists() else {}
+    best = {key:value for key,value in best.items() if value['step']<=step}
     with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator, (output_dir/'history.jsonl').open('a') as history:
         while epoch<training['epochs']:
             epoch_start = time.perf_counter()
             stage = args.stage or stage_for_epoch(epoch,config)
+            rate = learning_rate_for_epoch(epoch,config,stage)
+            for group in optimizer.param_groups:
+                group['lr'] = rate
             generator = torch.Generator().manual_seed(training['seed']+epoch)
             order = torch.randperm(count,generator=generator).tolist()
             loader = training_loader(train,order[offset:],batch_size=training['batch_size'],
@@ -582,6 +626,15 @@ def main():
             summary = dict(epoch=epoch_number,step=step,stage=stage,complete=complete,
                 train_mean_loss=loss_sum/loss_samples,train_samples=loss_samples,
                 validation=validation_summary(report),seconds=time.perf_counter()-epoch_start)
+            summary['learning_rate'] = rate
+            if training.get('save_best',False):
+                for name,candidate in best_checkpoint_candidates(summary).items():
+                    if name not in best or candidate['score']<best[name]['score']:
+                        save_checkpoint(output_dir/(name+'.pth'),model,optimizer,config=config,identity=identity,
+                            epoch=epoch,sample_offset=offset,step=step,runtime=runtime)
+                        best[name] = dict(candidate,epoch=epoch_number,step=step,
+                                          validation=summary['validation'])
+                best_path.write_text(json.dumps(best,indent=2,allow_nan=False)+'\n')
             summary['validation_performance'] = report['performance']
             if 'encoder_diagnostics' in report:
                 summary['encoder_diagnostics'] = report['encoder_diagnostics']

@@ -143,6 +143,8 @@ class ValidationRuntime:
         batch = default_collate([self.dataset[index]])
         source = recursive_numpy({key:batch[key] for key in
             ('vertices_gt', 'native_masks', 'native_pixel_spacing', 'pose_gt', 'view_present', 'annotated')})
+        if 'case_id' in batch:
+            source['case_id'] = batch['case_id']
         key = reference_signature([source['vertices_gt'], source['native_masks'],
             source['native_pixel_spacing'], source['view_present'], source['annotated'],
             *source['pose_gt'].values()], dict(context=self.context, index=index, stamp=stamp))

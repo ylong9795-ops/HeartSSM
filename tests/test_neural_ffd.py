@@ -183,6 +183,47 @@ class SliceTests(NeuralTestCase):
 
 
 class CheckpointTests(NeuralTestCase):
+    def test_long_schedule_rates_and_independent_checkpoint_selection(self):
+        from train_neural_ffd import learning_rate_for_epoch,stage_for_epoch,best_checkpoint_candidates,format_epoch_summary
+        config = dict(training=dict(epochs=180,shape_epochs=30,motion_epochs=30,
+                                    learning_rate=1e-4,joint_min_learning_rate=1e-5))
+        self.assertEqual([stage_for_epoch(i,config) for i in (0,29,30,59,60,179)],
+                         ['shape','shape','motion','motion','joint','joint'])
+        for i in (0,29,30,59,60):
+            self.assertEqual(learning_rate_for_epoch(i,config,stage_for_epoch(i,config)),1e-4)
+        self.assertAlmostEqual(learning_rate_for_epoch(179,config,'joint'),1e-5)
+        rates = [learning_rate_for_epoch(i,config,'joint') for i in range(60,180)]
+        self.assertTrue(all(a>=b for a,b in zip(rates,rates[1:])))
+        legacy = dict(training=dict(epochs=30,shape_epochs=3,motion_epochs=5,learning_rate=1e-4))
+        self.assertEqual(learning_rate_for_epoch(29,legacy,'joint'),1e-4)
+        summary = dict(complete=True,stage='joint',epoch=80,train_mean_loss=1.,validation=dict(
+            reference_vertex_rmse_mm=3.,relative_motion_rmse_mm=4.,mean_exact_dice=.99))
+        candidates = best_checkpoint_candidates(summary)
+        self.assertEqual(candidates['best_joint']['score'],5.)
+        self.assertEqual(candidates['best_dice']['score'],-.99)
+        # Better projection overlap must not conceal worsening reference error.
+        worse = dict(summary,validation=dict(summary['validation'],reference_vertex_rmse_mm=6.,mean_exact_dice=1.))
+        self.assertGreater(best_checkpoint_candidates(worse)['best_joint']['score'],5.)
+        self.assertLess(best_checkpoint_candidates(worse)['best_dice']['score'],-.99)
+        self.assertEqual(best_checkpoint_candidates(dict(summary,complete=False)),{})
+        self.assertEqual(best_checkpoint_candidates(dict(summary,stage='shape'))['best_shape']['score'],3.)
+        self.assertEqual(best_checkpoint_candidates(dict(summary,stage='motion'))['best_motion']['score'],5.)
+        self.assertEqual(format_epoch_summary(summary,180),
+            'Epoch 80/180 [joint] | Train loss=1.0000 | Val Shape RMSE=3.000 mm | Motion RMSE=4.000 mm | Dice=0.9900')
+
+    def test_reference_dice_summary_separates_cycle_cells(self):
+        from train_neural_ffd import validation_summary
+        metrics = {c:dict(reference_vertex_rmse_mm=1.,trajectory_vertex_rmse_mm=2.,
+                         relative_motion_rmse_mm=3.,volume_mae_ml=4.) for c in ('LV','LA','RV','RA')}
+        report = dict(case_count=1,cases=[dict(metrics=metrics,exact=dict(
+            summary=dict(cells=2,mean_exact_dice=.8),
+            cells=[dict(frame=0,exact_dice=.9),dict(frame=1,exact_dice=.7)]))])
+        summary = validation_summary(report)
+        self.assertAlmostEqual(summary['reference_exact_dice'],.9)
+        self.assertAlmostEqual(summary['mean_exact_dice'],.8)
+        report['cases'][0].pop('exact')
+        self.assertIsNone(validation_summary(report)['reference_exact_dice'])
+
     def test_optimizer_restore_geometry_identity_and_stages(self):
         from train_neural_ffd import save_checkpoint,load_checkpoint,stage_for_epoch
         torch.set_num_threads(2)
