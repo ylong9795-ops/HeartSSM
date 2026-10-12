@@ -50,13 +50,9 @@ def load_config(path):
     training = config['training']
     unknown = set(training)-{'device','seed','epochs','shape_epochs','motion_epochs','batch_size',
         'learning_rate','workers','cpu_threads','validation_cases','checkpoint_every_steps',
-        'output','joint_min_learning_rate','save_best','geometry_learning_rate_multiplier'}
+        'output','joint_min_learning_rate','save_best'}
     if unknown:
         raise ValueError('Unknown training settings: '+str(sorted(unknown)))
-    multiplier = training.get('geometry_learning_rate_multiplier',1.)
-    if (not math.isfinite(multiplier) or multiplier<=0
-            or (multiplier!=1 and config['encoder'].get('known_pose') is not True)):
-        raise ValueError('Positive geometry learning-rate multiplier requires known-pose encoding')
     data_config = yaml.safe_load(repository_path(config['data_config']).read_text())
     data = data_config['data']
     if (tuple(data['views'])!=VIEWS or tuple(data['chambers'])!=CHAMBERS
@@ -102,7 +98,9 @@ def to_device(value,device,non_blocking=False):
 def training_collate(samples,stage):
     """Exclude evaluation-only arrays before IPC and pinned-memory copies."""
     unused = {'native_masks','model_to_native','native_pixel_spacing','clipped_foreground'}
-    # Known acquisition geometry conditions the encoder in every stage.
+    # Physical acquisition geometry is needed only for joint slice supervision.
+    if stage != 'joint':
+        unused.update(('pose_gt','pixel_spacing','norm_to_mm'))
     return default_collate([{key:value for key,value in sample.items() if key not in unused}
                             for sample in samples])
 
@@ -183,14 +181,8 @@ def initialize_from_checkpoint(model,path,identity):
     source,saved = load_checkpoint(path)
     if saved['data_identity'] != identity or source.geometry_sha256 != model.geometry_sha256:
         raise ValueError('Initialization requires identical source data and fixed topology')
-    if source.encoder.known_pose and (not model.encoder.known_pose
-            or source.encoder.geometry_scale_mm != model.encoder.geometry_scale_mm):
-        raise ValueError('Initialization cannot remove or rescale an inherited geometry condition')
     old_encoder = dict(source.encoder_config)
     new_encoder = dict(model.encoder_config)
-    for settings in (old_encoder,new_encoder):
-        settings.pop('known_pose',None)
-        settings.pop('geometry_scale_mm',None)
     old_decoder,new_decoder = dict(source.decoder_config),dict(model.decoder_config)
     if model.regional_motion and not source.regional_motion:
         for settings in (old_decoder,new_decoder):
@@ -200,7 +192,7 @@ def initialize_from_checkpoint(model,path,identity):
     if old_encoder != new_encoder or old_decoder != new_decoder:
         raise ValueError('Initialization changes existing encoder/decoder configuration')
     current,previous = model.state_dict(),source.state_dict()
-    allowed = {'encoder.geometry_projection.weight'} if model.encoder.known_pose and not source.encoder.known_pose else set()
+    allowed = set()
     if model.regional_motion and not source.regional_motion:
         allowed.update(key for key in current if key.startswith('regional_motion_heads.') or key in
             ('regional_motion_lower_mm','regional_motion_upper_mm','regional_motion_origins_mm','regional_motion_spacings_mm'))
@@ -252,19 +244,7 @@ def learning_rate_for_epoch(epoch,config,stage):
 
 
 def make_optimizer(model,training):
-    """Warm a new geometry projection while preserving inherited update rates."""
-    rate = training['learning_rate']
-    multiplier = training.get('geometry_learning_rate_multiplier',1.)
-    if not math.isfinite(multiplier) or multiplier<=0:
-        raise ValueError('Positive finite geometry learning-rate multiplier required')
-    if multiplier==1:
-        return torch.optim.Adam(model.parameters(),lr=rate)
-    if not model.encoder.known_pose:
-        raise ValueError('Geometry learning-rate multiplier requires known-pose encoding')
-    projection = model.encoder.geometry_projection.weight
-    groups = [dict(params=[p for p in model.parameters() if p is not projection]),
-              dict(params=[projection],lr=rate*multiplier,learning_rate_scale=multiplier)]
-    return torch.optim.Adam(groups,lr=rate)
+    return torch.optim.Adam(model.parameters(),lr=training['learning_rate'])
 
 
 def best_checkpoint_candidates(summary):
@@ -508,7 +488,7 @@ def evaluate_with_runtime(model,dataset,device,*,cases,exact,progress,runtime):
     rows,pending = [],deque()
     counters = dict(gt_cells_verified=0,gt_cells_reused=0)
     compute_seconds,wait_seconds = 0.,0.
-    network_keys = ('masks','sdf','phases','view_present','annotated','pose_gt','pixel_spacing','norm_to_mm')
+    network_keys = ('masks','sdf','phases','view_present','annotated')
     with tqdm(total=count,desc='Validation',leave=False,dynamic_ncols=True,
               mininterval=1.,disable=not progress) as bar:
         def finish():
@@ -526,7 +506,7 @@ def evaluate_with_runtime(model,dataset,device,*,cases,exact,progress,runtime):
             bar.update()
         for index,(batch,source,key) in runtime.batches(count):
             t0 = time.perf_counter()
-            # Acquisition geometry is an observation; native labels stay on CPU.
+            # Pose and native labels stay on CPU for source-native evaluation.
             observations = {key:to_device(value,device) if key in network_keys else value
                             for key,value in batch.items()}
             output = model(observations)
@@ -658,7 +638,7 @@ def main():
             stage = args.stage or stage_for_epoch(epoch,config)
             rate = learning_rate_for_epoch(epoch,config,stage)
             for group in optimizer.param_groups:
-                group['lr'] = rate*group.get('learning_rate_scale',1.)
+                group['lr'] = rate
             generator = torch.Generator().manual_seed(training['seed']+epoch)
             order = torch.randperm(count,generator=generator).tolist()
             loader = training_loader(train,order[offset:],batch_size=training['batch_size'],

@@ -210,10 +210,12 @@ class SliceTests(NeuralTestCase):
                 left,right = net.chamber_ranges[chamber]
                 mask[frame,view,chamber] = exact_section_mask(gt[0,frame,left:right].numpy(),net.faces[c].numpy(),
                     np.eye(3),[0.,0.,.23],[.625,.625],(h,h))
+        x['vertices_gt'] = gt
         x['masks'] = torch.tensor(mask)[None]
         x['sdf'] = torch.tensor(mask_to_sdf(mask,[.625,.625],annotated=x['annotated'][0].numpy()))[None]
         out = net(x)
-        supervisor = MeshSliceSupervisor(net.chamber_ranges,net.faces,1.,sigma_mm=.4,pixel_stride=1)
+        supervisor = MeshSliceSupervisor(net.chamber_ranges,net.faces,1.,sigma_mm=.4,pixel_stride=1,
+            target_mode='paired_soft_geometry_v1')
         slices = supervisor(out['vertices_4d'],x)
         self.assertEqual(slices['diagnostics']['valid_cells'],t*8)
         criterion = NeuralFFDLoss(net.chamber_ranges,net.faces)
@@ -242,40 +244,16 @@ class SliceTests(NeuralTestCase):
 
 
 class CheckpointTests(NeuralTestCase):
-    def test_geometry_optimizer_preserves_inherited_rate_and_resume(self):
-        from train_neural_ffd import make_optimizer
-        old = small_model()
-        model = NeuralFFDNet(old.template_vertices_mm,old.chamber_ranges,old.faces,
-            template_sha256=old.template_sha256,asset_sha256=old.asset_sha256,norm_to_mm=old.norm_to_mm,
-            encoder_config=dict(old.encoder_config,known_pose=True),decoder_config=old.decoder_config)
-        settings = dict(learning_rate=1e-5,geometry_learning_rate_multiplier=100.)
-        optimizer = make_optimizer(model,settings)
-        projection = model.encoder.geometry_projection.weight
-        self.assertEqual(optimizer.param_groups[1]['params'],[projection])
-        self.assertEqual([g['lr'] for g in optimizer.param_groups],[1e-5,1e-3])
-        inherited = model.encoder.stem[0].weight
-        before = inherited.detach().clone()
-        inherited.grad,projection.grad = torch.ones_like(inherited),torch.ones_like(projection)
-        optimizer.step()
-        torch.testing.assert_close((before-inherited).abs().mean(),torch.tensor(1e-5),rtol=2e-3,atol=1e-8)
-        torch.testing.assert_close(projection.abs().mean(),torch.tensor(1e-3))
-        resumed = make_optimizer(model,settings)
-        resumed.load_state_dict(optimizer.state_dict())
-        self.assertEqual(resumed.param_groups[1]['learning_rate_scale'],100.)
-        self.assertEqual([g['lr'] for g in resumed.param_groups],[1e-5,1e-3])
-        self.assertEqual(len(make_optimizer(old,dict(learning_rate=1e-5)).param_groups),1)
-        with self.assertRaisesRegex(ValueError,'known-pose'):
-            make_optimizer(old,settings)
-
     def test_training_config_rejects_unimplemented_options(self):
         import copy
         import yaml
         from train_neural_ffd import load_config
-        path = Path(__file__).resolve().parents[1]/'configs/neural_ffd_1k_known_pose_regional.yaml'
+        path = Path(__file__).resolve().parents[1]/'configs/neural_ffd_1k_direct.yaml'
         config,_ = load_config(path)
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory)/'config.yaml'
-            for section,key in (('training','geometry_learning_rate'),(None,'pose_framework')):
+            for section,key in (('training','geometry_learning_rate'),
+                                ('training','geometry_learning_rate_multiplier'),(None,'pose_framework')):
                 wrong = copy.deepcopy(config)
                 if section is None:
                     wrong[key] = {}
@@ -304,18 +282,18 @@ class CheckpointTests(NeuralTestCase):
             with self.assertRaisesRegex(ValueError,'fixed control/topology buffer'):
                 load_checkpoint(path)
 
-    def test_audited_known_pose_initialization_preserves_all_old_weights(self):
+    def test_audited_initialization_preserves_all_old_weights(self):
         from train_neural_ffd import save_checkpoint,initialize_from_checkpoint
         torch.set_num_threads(2)
         old = small_model()
         current = NeuralFFDNet(old.template_vertices_mm,old.chamber_ranges,old.faces,
             template_sha256=old.template_sha256,asset_sha256=old.asset_sha256,norm_to_mm=old.norm_to_mm,
-            encoder_config=dict(old.encoder_config,known_pose=True),decoder_config=old.decoder_config)
+            encoder_config=old.encoder_config,decoder_config=old.decoder_config)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)/'old.pth'
             save_checkpoint(path,old,None,config={},identity={'split':'fixed'},step=800)
             result = initialize_from_checkpoint(current,path,{'split':'fixed'})
-            self.assertEqual(result['new_keys'],['encoder.geometry_projection.weight'])
+            self.assertEqual(result['new_keys'],[])
             self.assertEqual(result['source_step'],800)
             for key,value in old.state_dict().items():
                 self.assertTrue(torch.equal(value,current.state_dict()[key]),key)
@@ -367,10 +345,10 @@ class CheckpointTests(NeuralTestCase):
         self.assertIsNone(validation_summary(report)['reference_exact_dice'])
 
     def test_optimizer_restore_geometry_identity_and_stages(self):
-        from train_neural_ffd import save_checkpoint,load_checkpoint,stage_for_epoch
+        from train_neural_ffd import save_checkpoint,load_checkpoint,stage_for_epoch,make_optimizer
         torch.set_num_threads(2)
         net = small_model()
-        optimizer = torch.optim.Adam(net.parameters(),lr=.001)
+        optimizer = make_optimizer(net,dict(learning_rate=.001))
         z,m = torch.randn(1,12),torch.randn(1,4)
         optimizer.zero_grad()
         loss = net.decode_4d(z,m).square().mean()
@@ -379,7 +357,7 @@ class CheckpointTests(NeuralTestCase):
             path = Path(directory)/'model.pth'
             save_checkpoint(path,net,optimizer,config={'fixture':True},identity={'fixture':'abc'},epoch=2,sample_offset=1,step=3)
             restored,saved = load_checkpoint(path)
-            restored_optimizer = torch.optim.Adam(restored.parameters(),lr=.001)
+            restored_optimizer = make_optimizer(restored,dict(learning_rate=.001))
             restored_optimizer.load_state_dict(saved['optimizer'])
             self.assertEqual((saved['epoch'],saved['sample_offset'],saved['step']),(2,1,3))
             self.assertTrue(torch.equal(net.decode_4d(z,m),restored.decode_4d(z,m)))
@@ -405,78 +383,6 @@ def observations(batch=2, frames=4, side=32):
 
 
 class EncoderTests(NeuralTestCase):
-    def test_known_pose_geometry_sampling_units_and_failures(self):
-        torch.set_num_threads(2)
-        net = MultiViewTemporalEncoder(width=16,heads=2,temporal_layers=1,
-            spatial_sides=(14,7),query_slots=2,known_pose=True)
-        x = observations(batch=1,frames=2,side=224)
-        x.update(norm_to_mm=torch.tensor([10.]),pixel_spacing=torch.tensor([1.,2.])[None,None,None].repeat(1,2,3,1),
-            pose_gt=dict(probe_R=torch.eye(3)[None,None,None].repeat(1,2,3,1,1),
-                         probe_t=torch.tensor([1.,2.,3.])[None,None,None].repeat(1,2,3,1),
-                         probe_s=torch.ones(1,2,3,3)))
-        for scale,(side,first,stride) in enumerate(((14,4,16),(7,8,32))):
-            geometry = net.geometry_features(x,(224,224),scale)
-            self.assertEqual(geometry.shape,(1,2,3,side*side,6))
-            expected = torch.tensor([10.+(first-112)*2,20.+first-112,30.])
-            torch.testing.assert_close(geometry[0,0,0,0,:3]*100,expected)
-            # Round trip through the slice operator's (X-t)@R convention.
-            local = (geometry[...,:3]*100-10*x['pose_gt']['probe_t'][...,None,:])@torch.eye(3)
-            torch.testing.assert_close(local[...,2],torch.zeros_like(local[...,2]),atol=3e-6,rtol=0)
-            torch.testing.assert_close(local[0,0,0,1,0]-local[0,0,0,0,0],torch.tensor(float(stride*2)))
-            torch.testing.assert_close(geometry[...,3:],torch.tensor([0.,0.,1.]).expand_as(geometry[...,3:]))
-        x['pose_gt']['probe_R'][0,0,0] = torch.tensor([[0.,-1.,0.],[1.,0.,0.],[0.,0.,1.]])
-        point = net.geometry_features(x,(224,224),0)[0,0,0,0,:3]*100
-        torch.testing.assert_close(point,torch.tensor([118.,-196.,30.]))
-        for key in ('pose_gt','pixel_spacing','norm_to_mm'):
-            with self.assertRaisesRegex(ValueError,'requires'):
-                net.geometry_features({k:v for k,v in x.items() if k!=key},(224,224),0)
-        x['pose_gt']['probe_R'][0,0,0,0,0] = 2.
-        with self.assertRaisesRegex(ValueError,'orthonormal'):
-            net.geometry_features(x,(224,224),0)
-
-    def test_known_pose_both_paths_gradients_and_collation(self):
-        from train_neural_ffd import training_collate
-        torch.set_num_threads(2)
-        net = MultiViewTemporalEncoder(shape_dim=12,motion_dim=4,width=16,heads=2,
-            temporal_layers=1,spatial_sides=(4,2),query_slots=2,known_pose=True,
-            feature_transfer='direct_residual_v1').eval()
-        x = observations(batch=1)
-        x.update(norm_to_mm=torch.ones(1),pixel_spacing=torch.ones(1,4,3,2),
-                 pose_gt=dict(probe_R=torch.eye(3)[None,None,None].repeat(1,4,3,1,1),
-                              probe_t=torch.zeros(1,4,3,3),probe_s=torch.ones(1,4,3,3)))
-        for shape_gain,frame_gain in ((1.,1.),(0.,0.)):
-            net.direct_shape_gain,net.direct_frame_gain = shape_gain,frame_gain
-            codes = net(x)
-            for key in ('z_shape','z_motion'):
-                grad = torch.autograd.grad(codes[key].square().sum(),net.geometry_projection.weight,retain_graph=True)[0]
-                self.assertTrue(torch.isfinite(grad).all())
-                self.assertGreater(float(grad.norm()),0.)
-        # Direct descriptor itself receives the same projected geometry, with
-        # absent views zeroed after conditioning.
-        geometry = net.geometry_projection(net.geometry_features(x,(32,32),0))
-        self.assertEqual(geometry.shape,(1,4,3,16,16))
-        value = geometry.reshape(12,16,16).transpose(1,2).reshape(12,16,4,4)
-        pooled = net.direct_descriptors((value,torch.zeros(12,16,2,2)),torch.ones(4,3,dtype=torch.bool))
-        grad = torch.autograd.grad(net.direct_frame_projection(pooled).sum(),net.geometry_projection.weight)[0]
-        self.assertGreater(float(grad.norm()),0.)
-        sample = dict(pose_gt={k:v[0] for k,v in x['pose_gt'].items()},pixel_spacing=x['pixel_spacing'][0])
-        for stage in ('shape','motion','joint'):
-            batch = training_collate([sample],stage)
-            self.assertIn('pose_gt',batch)
-            self.assertIn('pixel_spacing',batch)
-        from types import SimpleNamespace
-        with torch.no_grad():
-            net.geometry_projection.weight.fill_(.02)
-            baseline = net(x)
-            with EncoderDiagnostics(SimpleNamespace(encoder=net)) as monitor:
-                measured = net(x)
-                summary = monitor.summary()
-            for key in baseline:
-                self.assertTrue(torch.equal(baseline[key],measured[key]))
-            self.assertTrue(summary['known_pose'])
-            self.assertGreater(summary['rms']['geometry_embedding'],0.)
-            self.assertTrue(all(not module._forward_hooks for module in net.modules()))
-
     def test_integrated_diagnostics_preserve_latents_and_release_hooks(self):
         from types import SimpleNamespace
         torch.set_num_threads(2)
@@ -511,26 +417,30 @@ class EncoderTests(NeuralTestCase):
 
     def test_latents_spatial_scales_and_gt_independence(self):
         torch.set_num_threads(2)
-        net = MultiViewTemporalEncoder(shape_dim=12, motion_dim=4, width=16, heads=2,
-                                      temporal_layers=1, spatial_sides=(4,2), query_slots=2, checkpoint_cnn=True)
-        x = observations()
-        latents = net(x)
-        self.assertEqual(latents['z_shape'].shape, (2,12))
-        self.assertEqual(latents['z_motion'].shape, (2,4))
-        maps = net.spatial_features(torch.randn(2,12,32,32))
-        self.assertEqual([tuple(v.shape) for v in maps], [(2,16,4,4),(2,16,2,2)])
-        (latents['z_shape'].square().sum()+latents['z_motion'].square().sum()).backward()
-        self.assertGreater(net.stem[0].weight.grad.norm().item(), 0)
-        net.eval()
-        with torch.no_grad():
-            first = net(x)
-            x['vertices_gt'], x['pose_gt'], x['proposal_coefficients'] = torch.tensor(float('nan')), 'forbidden', 'forbidden'
-            invalid = ~x['annotated'][:,None,:,:,None,None].expand_as(x['masks'])
-            x['masks'] = x['masks'].masked_fill(invalid, float('nan'))
-            x['sdf'] = x['sdf'].masked_fill(invalid, 999.)
-            second = net(x)
-        for key in first:
-            self.assertTrue(torch.equal(first[key], second[key]))
+        for mode in ('legacy','direct_residual_v1'):
+            with self.subTest(feature_transfer=mode):
+                net = MultiViewTemporalEncoder(shape_dim=12, motion_dim=4, width=16, heads=2,
+                                              temporal_layers=1, spatial_sides=(4,2), query_slots=2, checkpoint_cnn=True,
+                                              feature_transfer=mode)
+                x = observations()
+                latents = net(x)
+                self.assertEqual(latents['z_shape'].shape, (2,12))
+                self.assertEqual(latents['z_motion'].shape, (2,4))
+                maps = net.spatial_features(torch.randn(2,12,32,32))
+                self.assertEqual([tuple(v.shape) for v in maps], [(2,16,4,4),(2,16,2,2)])
+                (latents['z_shape'].square().sum()+latents['z_motion'].square().sum()).backward()
+                self.assertGreater(net.stem[0].weight.grad.norm().item(), 0)
+                net.eval()
+                with torch.no_grad():
+                    first = net(x)
+                    x['vertices_gt'], x['pose_gt'], x['proposal_coefficients'] = torch.tensor(float('nan')), 'forbidden', 'forbidden'
+                    x['pixel_spacing'], x['norm_to_mm'] = 'forbidden', 'forbidden'
+                    invalid = ~x['annotated'][:,None,:,:,None,None].expand_as(x['masks'])
+                    x['masks'] = x['masks'].masked_fill(invalid, float('nan'))
+                    x['sdf'] = x['sdf'].masked_fill(invalid, 999.)
+                    second = net(x)
+                for key in first:
+                    self.assertTrue(torch.equal(first[key], second[key]))
 
     def test_missing_view_frame_and_bad_phase(self):
         torch.set_num_threads(2)

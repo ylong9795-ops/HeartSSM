@@ -59,6 +59,8 @@ class FixtureDataset(Dataset):
 
 
 class FixtureModel(nn.Module):
+    regional_motion = False
+
     def __init__(self,dataset):
         super().__init__()
         self.register_buffer('chamber_ranges',dataset.ranges.clone())

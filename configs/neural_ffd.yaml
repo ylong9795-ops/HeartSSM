@@ -21,6 +21,7 @@ decoder:
   global_shape_dim: 32
   regional_grid_shape: [4, 4, 4]
 slice:
+  target_mode: paired_soft_geometry_v1
   sigma_mm: 1.0
   pixel_stride: 4
   chunk_size: 256

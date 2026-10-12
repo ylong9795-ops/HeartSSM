@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader,Subset
 
-from data.mask_transform import CHAMBERS,VIEWS,_validity
+from data.mask_transform import CHAMBERS,VIEWS
 from data.synthetic_4d import _sha256
 from net.neural_ffdnet import geometry_digest
 from net.multiview_encoder import observation_validity
@@ -129,97 +129,6 @@ def compare_evaluations(reference,candidate):
             item[key] = dict(reference=float(a.mean()),candidate=float(b.mean()),delta=float((b-a).mean()))
         result['chambers'][c] = item
     return result
-
-
-def pose_consistency(args,model,dataset):
-    """Same GT, synchronized rerendered legal small acquisition perturbations.
-
-    The mismatched input is an explicitly invalid negative control, never a
-    synthetic case. Source masks/meshes are untouched; all renders are in memory.
-    """
-    import copy
-    import trimesh
-    from scipy.spatial.transform import Rotation
-    models = {'known_pose':model}
-    if args.comparison_checkpoint:
-        models['comparison'],_ = load_checkpoint(args.comparison_checkpoint,args.device)
-    for value in models.values():
-        value.eval()
-        if value.geometry_sha256 != model.geometry_sha256:
-            raise ValueError('Consistency comparison requires identical fixed geometry')
-    rows = []
-    # Fixed before scoring models: TRAIN-independent geometry audit of the
-    # first16 VAL identities rejects 2deg/2mm (7 clipped sections), whereas
-    # 1deg/1mm retains every observed section and stays inside the native FOV.
-    rotation_degrees,translation_mm = 1.,1.
-    turn = Rotation.from_rotvec(np.array([np.deg2rad(rotation_degrees),0.,0.])).as_matrix()
-    with torch.no_grad():
-        for index in range(min(args.cases,len(dataset))):
-            source = dataset[index]
-            alternate = copy.deepcopy(source)
-            pose = alternate['pose_gt']
-            pose['probe_R'] = torch.from_numpy(pose['probe_R'].numpy()@turn).to(source['pose_gt']['probe_R'])
-            pose['probe_t'] += pose['probe_R'][...,2]*(translation_mm/dataset.norm_to_mm)
-            native = np.zeros_like(source['native_masks'].numpy())
-            valid = _validity(len(native),source['view_present'].numpy(),source['annotated'].numpy())
-            for frame,view,chamber in np.argwhere(valid):
-                c = CHAMBERS[chamber]
-                left,right = model.chamber_ranges[chamber].tolist()
-                # The original label renderer clips polygons at the native
-                # image edge. Reject that acquisition before calling it:
-                # clipping must not silently make a perturbed probe legal.
-                mesh = trimesh.Trimesh(vertices=source['vertices_gt'][frame,left:right].numpy(),
-                    faces=model.faces[c].cpu().numpy(),process=False)
-                rotation = pose['probe_R'][frame,view].numpy()
-                origin_mm = pose['probe_t'][frame,view].numpy()*dataset.norm_to_mm
-                section = mesh.section(plane_origin=origin_mm,plane_normal=rotation[:,2])
-                if section is not None:
-                    local = (section.vertices-origin_mm)@rotation
-                    extent_mm = pose['probe_s'][frame,view,:2].numpy()*dataset.norm_to_mm
-                    if (np.abs(local[:,:2])>extent_mm+1e-4).any():
-                        raise ValueError(f'Perturbed probe clips a native section: case={source["case_id"]}, frame={frame}, view={view}, chamber={c}')
-                native[frame,view,chamber] = render_source_slice(source['vertices_gt'][frame,left:right].numpy(),
-                    model.faces[c].cpu().numpy(),pose['probe_R'][frame,view].numpy(),pose['probe_t'][frame,view].numpy(),
-                    pose['probe_s'][frame,view].numpy(),dataset.norm_to_mm,native.shape[-2:])
-            transformed = dataset.mask_transform(native,source['native_pixel_spacing'].numpy(),
-                view_present=source['view_present'].numpy(),annotated=source['annotated'].numpy())
-            alternate.update({k:torch.from_numpy(np.ascontiguousarray(v)) for k,v in transformed.items()})
-            alternate['native_masks'] = torch.from_numpy(native)
-            if not torch.equal(source['vertices_gt'],alternate['vertices_gt']):
-                raise ValueError('Pose rerender modified GT identity')
-            if (valid & source['native_masks'].numpy().any((-1,-2)) & ~native.any((-1,-2))).any():
-                raise ValueError('Perturbed probe loses an originally observed chamber section')
-            # Compare correct/wrong pose while holding the observed mask fixed.
-            # Comparing altered masks with original masks would confound this
-            # negative control with the quality of two different acquisitions.
-            mismatch = dict(alternate,pose_gt=source['pose_gt'])
-            original_mismatch = dict(source,pose_gt=pose)
-            batches = {key:to_device(training_collate([sample],'joint'),args.device)
-                       for key,sample in (('original',source),('matched_alternate',alternate),
-                           ('mismatched_negative_control',mismatch),('original_mask_wrong_pose',original_mismatch))}
-            record = dict(case_id=source['case_id'],coordinate_sha256=source['coordinate_sha256'],
-                perturbation=dict(local_x_rotation_degrees=rotation_degrees,normal_translation_mm=translation_mm),
-                negative_control='alternate Mask/SDF with original Pose; original_mask_wrong_pose holds original Mask/SDF fixed',
-                changed_native_pixels=int(np.count_nonzero(native!=source['native_masks'].numpy())),models={})
-            for name,value in models.items():
-                outputs = {key:value(batch)['vertices_4d'] for key,batch in batches.items()}
-                truth = batches['original']['vertices_gt'].to(outputs['original'])
-                metrics = {key:reconstruction_metrics(p,truth,value.chamber_ranges,value.faces) for key,p in outputs.items()}
-                record['models'][name] = dict(metrics=metrics,
-                    reference_prediction_difference_mm=float((outputs['original'][:,0]-outputs['matched_alternate'][:,0]).square().sum(-1).mean().sqrt()),
-                    trajectory_prediction_difference_mm=float((outputs['original']-outputs['matched_alternate']).square().sum(-1).mean().sqrt()),
-                    same_alternate_mask_pose_effect_mm=float((outputs['matched_alternate']-outputs['mismatched_negative_control']).square().sum(-1).mean().sqrt()),
-                    same_original_mask_pose_effect_mm=float((outputs['original']-outputs['original_mask_wrong_pose']).square().sum(-1).mean().sqrt()))
-            rows.append(record)
-            print('Pose consistency:',source['case_id'],{k:v['reference_prediction_difference_mm'] for k,v in record['models'].items()},flush=True)
-    args.output.mkdir(parents=True,exist_ok=True)
-    (args.output/'pose_consistency.json').write_text(json.dumps(dict(scope='Small legal paired rerenders; mismatch is an invalid negative control',
-        split=args.pose_consistency_split,manifest_sha256=dataset.manifest_sha256,
-        inference_precision=dict(cuda_matmul_tf32=torch.backends.cuda.matmul.allow_tf32,
-            cudnn_tf32=torch.backends.cudnn.allow_tf32,tensor_dtype='float32'),
-        checkpoint=str(args.checkpoint),checkpoint_sha256=_sha256(args.checkpoint),
-        comparison_checkpoint_sha256=_sha256(args.comparison_checkpoint) if args.comparison_checkpoint else None,
-        rows=rows),indent=2,allow_nan=False)+'\n')
 
 
 def figures(model,trajectory,batch,destination):
@@ -361,9 +270,6 @@ def main():
     parser.add_argument('--output',type=Path,default=ROOT/'outputs/neural_ffd_check')
     parser.add_argument('--benchmark-joint',action='store_true')
     parser.add_argument('--audit-slice-targets',action='store_true',help='Measure slice gradient at exact continuous GT before joint training')
-    parser.add_argument('--pose-consistency',action='store_true')
-    parser.add_argument('--pose-consistency-split',choices=('train','val'),default='val')
-    parser.add_argument('--comparison-checkpoint',type=Path)
     parser.add_argument('--cases',type=int,default=2)
     parser.add_argument('--repeats',type=int,default=3)
     parser.add_argument('--cell-chunks',type=int,nargs='+',default=[8,16,32])
@@ -387,13 +293,10 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     config,data_config = load_config(args.config)
-    dataset = dataset_from_config(data_config,args.pose_consistency_split if args.pose_consistency else 'train')
+    dataset = dataset_from_config(data_config,'train')
     model,saved = load_checkpoint(args.checkpoint,args.device)
     if model.template_sha256!=dataset.template_sha256 or model.asset_sha256!=dataset.asset_sha256:
         raise ValueError('Checkpoint/dataset geometry mismatch')
-    if args.pose_consistency:
-        pose_consistency(args,model,dataset)
-        return
     if args.audit_slice_targets:
         rows = []
         slicer = MeshSliceSupervisor(model.chamber_ranges,model.faces,model.norm_to_mm,
@@ -430,9 +333,6 @@ def main():
               ('motion','motion_head',model.deform3.motion.weight),('motion','z_motion',output['z_motion']),
               ('slice','shape_head',model.deform3.reference.weight),('slice','motion_head',model.deform3.motion.weight),
               ('slice','encoder',model.encoder.stem[0].weight)]
-    if model.encoder.known_pose:
-        routes += [('shape','geometry_projection',model.encoder.geometry_projection.weight),
-                   ('motion','geometry_projection',model.encoder.geometry_projection.weight)]
     if model.regional_motion:
         routes += [('motion','regional_motion_'+c,head[-1].weight) for c,head in zip(CHAMBERS,model.regional_motion_heads)]
     for term,name,parameter in routes:
