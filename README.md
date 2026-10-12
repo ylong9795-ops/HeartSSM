@@ -160,3 +160,36 @@ See [implementation and validation](docs/neural_ffd.rst),
 [public-source review](docs/neural_ffd_sources.json), and
 [configuration](configs/neural_ffd.yaml). Architecture checks do not establish
 trained reconstruction accuracy; formal population training remains to be run.
+
+## Known-pose geometry and regional Motion
+
+[Pose-only configuration](configs/neural_ffd_1k_known_pose.yaml) adds a shared
+3D token-location/plane-normal projection before multiview attention and inside
+the direct residual descriptors. Known synthetic R/t/s, canonical pixel spacing
+and asset normalization are required in every training stage. Missing or invalid
+geometry raises an error. GT vertices and SSM coefficients remain supervision.
+
+[Pose + regional Motion configuration](configs/neural_ffd_1k_known_pose_regional.yaml)
+keeps the three global FFD levels and the incremental FineMotionHead. Four small
+MLPs generate fixed-domain 5×5×5 B-spline increments from the existing 32D Motion,
+8D chamber Shape and shared phase condition. Regional outputs start at zero,
+preserve reference Shape, and add 58,844 shared parameters with no new patient
+latent or independent vertex offsets. Physical boxes use template/TRAIN bounds;
+all 24 frames share the original vertices and faces.
+
+These configurations are five-epoch, 4,000-update experiments initialized from
+a frozen checkpoint using `--initialize`. Inherited/new keys are audited and
+loaded with `strict=True`; `--resume` separately restores an identical experiment.
+Both experiment arms use `paired_soft_geometry_v1` slice supervision, whose
+gradient is stationary at continuous GT. Original masks, source-native Exact
+Dice and old checkpoints remain independently available.
+
+Numerical contracts are in `tests/test_neural_ffd.py`; real-case audits and paired
+validation summaries use `scripts/check_neural_ffd.py`. Current results live in
+`outputs/known_pose_regional_v1/`: frozen baseline, engineering reports, legal
+paired Probe rerenders, independent training logs and full per-chamber/phase
+metrics. Both matched 4,000-update runs and full 100-case reports are complete.
+Regional RV/RA Motion RMSE improved only about 0.077%/0.071%; meaningful gains
+and eligibility for 10K training have not been established. The original
+180-epoch run stopped after 162 complete epochs; its final baseline remains
+pending. See `outputs/known_pose_regional_v1/p5_review.json` for the assessment.

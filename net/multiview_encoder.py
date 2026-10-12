@@ -40,7 +40,8 @@ class MultiViewTemporalEncoder(nn.Module):
                  temporal_layers=2, spatial_sides=(14, 7), query_slots=8,
                  sdf_scale_mm=15., cnn_chunk_size=6, checkpoint_cnn=True,
                  feature_transfer='legacy', direct_pool_side=2,
-                 direct_frame_gain=1., direct_shape_gain=1.):
+                 direct_frame_gain=1., direct_shape_gain=1.,
+                 known_pose=False, geometry_scale_mm=100.):
         super().__init__()
         if (min(shape_dim, motion_dim, width, heads, temporal_layers, query_slots, cnn_chunk_size) < 1
                 or width % heads or len(spatial_sides) != 2 or min(spatial_sides) < 2
@@ -57,6 +58,9 @@ class MultiViewTemporalEncoder(nn.Module):
         self.cnn_chunk_size, self.checkpoint_cnn = cnn_chunk_size, checkpoint_cnn
         self.feature_transfer, self.direct_pool_side = feature_transfer, direct_pool_side
         self.direct_frame_gain, self.direct_shape_gain = direct_frame_gain, direct_shape_gain
+        if type(known_pose) is not bool or not math.isfinite(geometry_scale_mm) or geometry_scale_mm <= 0:
+            raise ValueError('Explicit known-pose mode and positive geometry scale in mm required')
+        self.known_pose, self.geometry_scale_mm = known_pose, geometry_scale_mm
         # GroupNorm is independent of batch/chunk composition and supports B=1.
         backbone = resnet18(weights=None, norm_layer=partial(nn.GroupNorm, 8))
         backbone.conv1 = nn.Conv2d(12, 64, 7, stride=2, padding=3, bias=False)
@@ -88,6 +92,54 @@ class MultiViewTemporalEncoder(nn.Module):
             self.direct_shape_projection = nn.Linear(width, shape_dim, bias=False)
             nn.init.xavier_uniform_(self.direct_frame_projection.weight)
             nn.init.xavier_uniform_(self.direct_shape_projection.weight)
+        if self.known_pose:
+            # One shared projection for spatial attention AND direct descriptors.
+            # Zero initialization gives an exact inherited-weight starting point.
+            self.geometry_projection = nn.Linear(6, width, bias=False)
+            nn.init.zeros_(self.geometry_projection.weight)
+
+    def geometry_features(self, observations, image_shape, scale):
+        """[B,T,3,K,6]: centered mm location / scale, then unit plane normal.
+
+        ResNet layer2/layer3 centers are 0,8,... / 0,16,... in source pixels.
+        Adaptive pooling averages those centers in its actual bins, including
+        overlapping bins for non-divisible feature sizes. A 224 input therefore
+        has 14-side centers 4+16*k and 7-side centers 8+32*k, not low-res indices.
+        Canonical spacing is (y,x); pose translation is normalized source units.
+        """
+        b,t = observations['masks'].shape[:2]
+        if 'pose_gt' not in observations or 'pixel_spacing' not in observations or 'norm_to_mm' not in observations:
+            raise ValueError('Known-pose encoding requires pose_gt, pixel_spacing and norm_to_mm')
+        pose = observations['pose_gt']
+        if not isinstance(pose, dict) or set(pose) != {'probe_R','probe_t','probe_s'}:
+            raise ValueError('Known-pose encoding requires probe_R, probe_t and probe_s')
+        r,tr,s = (pose[key].to(self.view_embedding) for key in ('probe_R','probe_t','probe_s'))
+        spacing = observations['pixel_spacing'].to(self.view_embedding)
+        physical_scale = torch.as_tensor(observations['norm_to_mm'],device=r.device,dtype=r.dtype)
+        if (r.shape != (b,t,3,3,3) or tr.shape != (b,t,3,3) or s.shape != (b,t,3,3)
+                or spacing.shape != (b,t,3,2) or physical_scale.shape != (b,)):
+            raise ValueError('Known-pose frame/view/physical-scale shape mismatch')
+        if (not all(torch.isfinite(v).all() for v in (r,tr,s,spacing,physical_scale))
+                or (spacing <= 0).any() or (s <= 0).any() or (physical_scale <= 0).any()
+                or not torch.allclose(r.transpose(-1,-2)@r,torch.eye(3,device=r.device,dtype=r.dtype),atol=1e-4,rtol=0)
+                or (torch.linalg.det(r) <= 0).any()):
+            raise ValueError('Finite right-handed orthonormal known poses and positive physical scales required')
+        stride = (8,16)[scale]
+        side = self.spatial_sides[scale]
+        axes = []
+        for size in image_shape:
+            feature_size = (size+stride-1)//stride
+            k = torch.arange(side,device=r.device,dtype=r.dtype)
+            first = torch.floor(k*feature_size/side)
+            last = torch.ceil((k+1)*feature_size/side)-1
+            axes.append((first+last)*(.5*stride)-size/2)
+        yy,xx = torch.meshgrid(*axes,indexing='ij')
+        xy = torch.stack((xx,yy),-1).reshape(-1,2)
+        local_xy = xy*spacing[...,None,[1,0]]
+        xyz = (tr*physical_scale[:,None,None,None])[...,None,:] + torch.einsum(
+            'btvij,btvkj->btvki',r[...,:2],local_xy)
+        normal = r[...,2].unsqueeze(-2).expand_as(xyz)
+        return torch.cat((xyz/self.geometry_scale_mm,normal),-1)
 
     def spatial_features(self, x):
         """Retain layer2/layer3 feature maps; no early global average pooling."""
@@ -100,7 +152,8 @@ class MultiViewTemporalEncoder(nn.Module):
     def direct_descriptors(self, maps, view_valid):
         """[BT*3,C,H,W] maps -> [BT,3*2*C*K*K], ordered view then scale.
 
-        Inputs are the same CNN maps used by attention, before any embeddings.
+        Inputs are the same maps used by attention, including known geometry
+        when enabled, before view/scale/availability embeddings.
         A missing/unannotated view is zeroed AFTER the CNN, so convolution
         biases and normalization cannot create an observed direct feature.
         view_valid is [BT,3], derived from chamber annotation, not foreground.
@@ -122,8 +175,8 @@ class MultiViewTemporalEncoder(nn.Module):
         return torch.cat(pooled, dim=2).flatten(1)
 
     def forward(self, observations):
-        # Only these observation fields are read. Mesh, SSM scores and GT pose
-        # are never features, even if a Dataset item includes them.
+        # Only observations and explicitly enabled known acquisition geometry
+        # are read. GT mesh, SSM scores and patient displacements are excluded.
         masks, sdf = observations['masks'], observations['sdf']
         if (masks.ndim != 6 or masks.shape[2:4] != (3, 4) or sdf.shape != masks.shape
                 or min(masks.shape[:2])<1
@@ -160,6 +213,13 @@ class MultiViewTemporalEncoder(nn.Module):
                 values.append(value)
         # Concatenate each CNN scale once and reuse it for both pathways.
         maps = tuple(torch.cat(pieces) for pieces in chunks)
+        if self.known_pose:
+            conditioned = []
+            for scale,value in enumerate(maps):
+                geometry = self.geometry_projection(self.geometry_features(observations,(height,width),scale))
+                geometry = geometry.reshape(b*t*3,-1,self.width).transpose(1,2).reshape_as(value)
+                conditioned.append(value+geometry)
+            maps = tuple(conditioned)
         direct = None
         if self.feature_transfer == 'direct_residual_v1':
             descriptors = self.direct_descriptors(maps, valid.any(-1).reshape(b*t,3))
@@ -223,6 +283,7 @@ class EncoderDiagnostics:
         valid = observation_validity(batch, b, t, module.view_embedding.device)
         self.frame_valid = valid.any(-1).any(-1).reshape(-1)
         self.reference_valid = valid[:,0].any(-1).any(-1)
+        self.view_valid = valid.any(-1)
         # Counts are reduced on GPU and copied together at the end.
         self.valid_frames = self.valid_frames + self.frame_valid.sum()
         self.observed_references = self.observed_references + self.reference_valid.sum()
@@ -247,6 +308,10 @@ class EncoderDiagnostics:
     def _shape_direct(self, module, args, value):
         self._record('shape_direct', value*self.encoder.direct_shape_gain)
 
+    def _geometry(self, module, args, value):
+        mask = self.view_valid[...,None].expand(value.shape[:-1])
+        self._record('geometry_embedding',value,mask)
+
     def _after_encoder(self, module, args, output):
         self._record('shape_latent', output['z_shape'])
         # Float64 accumulation resolves near-constant latents without float32
@@ -269,6 +334,8 @@ class EncoderDiagnostics:
             lambda module,args,value:self._record('time_embedding', value.reshape(-1,value.shape[-1]), self.frame_valid)))
         self.handles.append(self.encoder.direct_frame_projection.register_forward_hook(self._frame_direct))
         self.handles.append(self.encoder.direct_shape_projection.register_forward_hook(self._shape_direct))
+        if self.encoder.known_pose:
+            self.handles.append(self.encoder.geometry_projection.register_forward_hook(self._geometry))
         self.handles.append(self.encoder.register_forward_hook(self._after_encoder))
         return self
 
@@ -282,7 +349,7 @@ class EncoderDiagnostics:
         rms = {key:math.sqrt(value) for key,value in zip(keys, values)}
         def ratio(numerator, denominator):
             return rms[numerator]/rms[denominator] if rms[denominator] > 0 else None
-        return dict(feature_transfer=self.encoder.feature_transfer, cases=self.cases,
+        return dict(feature_transfer=self.encoder.feature_transfer, known_pose=self.encoder.known_pose,cases=self.cases,
             valid_frames=int(values[-2]), observed_reference_cases=int(values[-1]), rms=rms,
             frame_direct_to_attention_ratio=ratio('frame_direct','frame_attention'),
             shape_direct_to_main_ratio=ratio('shape_direct','shape_main'),

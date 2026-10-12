@@ -44,6 +44,19 @@ def repository_path(value):
 
 def load_config(path):
     config = yaml.safe_load(Path(path).read_text())
+    unknown = set(config)-{'data_config','encoder','decoder','slice','loss','training'}
+    if unknown:
+        raise ValueError('Unknown configuration sections: '+str(sorted(unknown)))
+    training = config['training']
+    unknown = set(training)-{'device','seed','epochs','shape_epochs','motion_epochs','batch_size',
+        'learning_rate','workers','cpu_threads','validation_cases','checkpoint_every_steps',
+        'output','joint_min_learning_rate','save_best','geometry_learning_rate_multiplier'}
+    if unknown:
+        raise ValueError('Unknown training settings: '+str(sorted(unknown)))
+    multiplier = training.get('geometry_learning_rate_multiplier',1.)
+    if (not math.isfinite(multiplier) or multiplier<=0
+            or (multiplier!=1 and config['encoder'].get('known_pose') is not True)):
+        raise ValueError('Positive geometry learning-rate multiplier requires known-pose encoding')
     data_config = yaml.safe_load(repository_path(config['data_config']).read_text())
     data = data_config['data']
     if (tuple(data['views'])!=VIEWS or tuple(data['chambers'])!=CHAMBERS
@@ -52,7 +65,6 @@ def load_config(path):
             or data['expected_phases']!=config['decoder']['frames']
             or data_config['mask']['sdf_normalize'] or not data_config['mask']['use_sdf']):
         raise ValueError('Canonical full-cycle masks, physical SDF and synchronized fixed decoder phases required')
-    training = config['training']
     if (min(training[k] for k in ('epochs','batch_size','cpu_threads','validation_cases','checkpoint_every_steps'))<1
             or min(training['shape_epochs'],training['motion_epochs'],training['workers'])<0
             or training['shape_epochs']+training['motion_epochs']>=training['epochs']):
@@ -90,8 +102,7 @@ def to_device(value,device,non_blocking=False):
 def training_collate(samples,stage):
     """Exclude evaluation-only arrays before IPC and pinned-memory copies."""
     unused = {'native_masks','model_to_native','native_pixel_spacing','clipped_foreground'}
-    if stage!='joint':
-        unused.update(('pose_gt','pixel_spacing'))
+    # Known acquisition geometry conditions the encoder in every stage.
     return default_collate([{key:value for key,value in sample.items() if key not in unused}
                             for sample in samples])
 
@@ -120,6 +131,7 @@ def save_checkpoint(path,model,optimizer,*,config,identity,epoch=0,sample_offset
             template_sha256=model.template_sha256,asset_sha256=model.asset_sha256,
             norm_to_mm=model.norm_to_mm,geometry_sha256=model.geometry_sha256),
         model=model.state_dict(),optimizer=None if optimizer is None else optimizer.state_dict(),
+        initialization=getattr(model,'initialization_metadata',None),
         config=config,data_identity=identity,epoch=epoch,sample_offset=sample_offset,step=step,runtime=runtime,
         rng=dict(torch=torch.get_rng_state(),python=random.getstate(),
                  numpy=(rng_numpy[0],rng_numpy[1].tolist(),*rng_numpy[2:]),
@@ -150,11 +162,59 @@ def load_checkpoint(path,device='cpu'):
              *['faces_'+c for c in CHAMBERS])
     if model.regional_shape:
         fixed += ('regional_origin_mm','regional_spacing_mm')
+    if model.regional_motion:
+        fixed += ('regional_motion_lower_mm','regional_motion_upper_mm',
+                  'regional_motion_origins_mm','regional_motion_spacings_mm')
     for key in fixed:
         if not torch.equal(model.state_dict()[key],state[key]):
             raise ValueError('Checkpoint fixed control/topology buffer differs: '+key)
     model.load_state_dict(state,strict=True)
+    model.initialization_metadata = saved.get('initialization')
     return model.to(device),saved
+
+
+def initialize_from_checkpoint(model,path,identity):
+    """Explicit inherited weights with a precise new-module allowlist.
+
+    Never use strict=False. Reject missing old weights, altered geometry,
+    encoder dimensions or decoder settings before constructing a complete state.
+    Optimizer and update counters start afresh for the matched-budget experiment.
+    """
+    source,saved = load_checkpoint(path)
+    if saved['data_identity'] != identity or source.geometry_sha256 != model.geometry_sha256:
+        raise ValueError('Initialization requires identical source data and fixed topology')
+    if source.encoder.known_pose and (not model.encoder.known_pose
+            or source.encoder.geometry_scale_mm != model.encoder.geometry_scale_mm):
+        raise ValueError('Initialization cannot remove or rescale an inherited geometry condition')
+    old_encoder = dict(source.encoder_config)
+    new_encoder = dict(model.encoder_config)
+    for settings in (old_encoder,new_encoder):
+        settings.pop('known_pose',None)
+        settings.pop('geometry_scale_mm',None)
+    old_decoder,new_decoder = dict(source.decoder_config),dict(model.decoder_config)
+    if model.regional_motion and not source.regional_motion:
+        for settings in (old_decoder,new_decoder):
+            for key in tuple(settings):
+                if key.startswith('regional_motion'):
+                    settings.pop(key)
+    if old_encoder != new_encoder or old_decoder != new_decoder:
+        raise ValueError('Initialization changes existing encoder/decoder configuration')
+    current,previous = model.state_dict(),source.state_dict()
+    allowed = {'encoder.geometry_projection.weight'} if model.encoder.known_pose and not source.encoder.known_pose else set()
+    if model.regional_motion and not source.regional_motion:
+        allowed.update(key for key in current if key.startswith('regional_motion_heads.') or key in
+            ('regional_motion_lower_mm','regional_motion_upper_mm','regional_motion_origins_mm','regional_motion_spacings_mm'))
+    if set(current)-set(previous) != allowed or set(previous)-set(current):
+        raise ValueError('Initialization weight changes differ from explicit new-module allowlist')
+    for key,value in previous.items():
+        if current[key].shape != value.shape or current[key].dtype != value.dtype:
+            raise ValueError('Incompatible inherited weight: '+key)
+        current[key] = value
+    model.load_state_dict(current,strict=True)
+    model.initialization_metadata = dict(checkpoint_sha256=_sha256(path),source_epoch=saved['epoch'],
+        source_step=saved['step'],inherited_keys=sorted(previous),new_keys=sorted(allowed),
+        optimizer='new Adam; update counter excludes inherited training')
+    return model.initialization_metadata
 
 
 def restore_rng(saved,device):
@@ -191,6 +251,22 @@ def learning_rate_for_epoch(epoch,config,stage):
     return minimum+(base-minimum)*(1+math.cos(math.pi*fraction))/2
 
 
+def make_optimizer(model,training):
+    """Warm a new geometry projection while preserving inherited update rates."""
+    rate = training['learning_rate']
+    multiplier = training.get('geometry_learning_rate_multiplier',1.)
+    if not math.isfinite(multiplier) or multiplier<=0:
+        raise ValueError('Positive finite geometry learning-rate multiplier required')
+    if multiplier==1:
+        return torch.optim.Adam(model.parameters(),lr=rate)
+    if not model.encoder.known_pose:
+        raise ValueError('Geometry learning-rate multiplier requires known-pose encoding')
+    projection = model.encoder.geometry_projection.weight
+    groups = [dict(params=[p for p in model.parameters() if p is not projection]),
+              dict(params=[projection],lr=rate*multiplier,learning_rate_scale=multiplier)]
+    return torch.optim.Adam(groups,lr=rate)
+
+
 def best_checkpoint_candidates(summary):
     """Select paired shape/motion errors before they can cancel in trajectories."""
     if not summary['complete']:
@@ -210,8 +286,20 @@ def compute_objective(model,batch,criterion,slicer,stage):
     slices = slicer(output['vertices_4d'],batch) if stage=='joint' else None
     losses = criterion(output,batch['vertices_gt'],slice_result=slices,
         control_spacings_mm=model.control_spacings_mm,
-        regional_spacing_mm=model.regional_spacing_mm if model.regional_shape else None,stage=stage)
+        regional_spacing_mm=model.regional_spacing_mm if model.regional_shape else None,
+        regional_motion_spacings_mm=model.regional_motion_spacings_mm if model.regional_motion else None,stage=stage)
     return output,losses,slices
+
+
+def regional_motion_diagnostics(output):
+    """Per-phase/chamber mm statistics; no independent vertex motion interface."""
+    grids = output['control_grids']['regional_motion'].detach()
+    return dict(chambers=list(CHAMBERS),
+        increment_displacement_rms_mm=output['regional_motion_rms_mm'].detach().cpu().tolist(),
+        control_rms_mm=grids.square().mean((3,4,5,6)).sqrt().cpu().tolist(),
+        adjacent_control_change_rms_mm=grids.diff(dim=1).square().mean((3,4,5,6)).sqrt().cpu().tolist(),
+        first_last_increment_control_change_rms_mm=(grids[:,1]-grids[:,-1]).square().mean((2,3,4,5)).sqrt().cpu().tolist(),
+        reference_control='exact zero; reference Shape is independent of regional Motion')
 
 
 def surface_metrics(predicted,truth,faces,samples=5000,reference_cache=None):
@@ -400,6 +488,8 @@ def evaluate_serial(model,dataset,device,*,cases,exact=False,progress=False):
         output = model(batch)
         metrics = reconstruction_metrics(output['vertices_4d'],batch['vertices_gt'],model.chamber_ranges,model.faces)
         item = dict(case_id=batch['case_id'][0],metrics=metrics)
+        if model.regional_motion:
+            item['regional_motion'] = regional_motion_diagnostics(output)
         if exact:
             item['exact'] = exact_metrics(model,output['vertices_4d'],batch)
             for c,(left,right) in zip(CHAMBERS,model.chamber_ranges.tolist()):
@@ -418,7 +508,7 @@ def evaluate_with_runtime(model,dataset,device,*,cases,exact,progress,runtime):
     rows,pending = [],deque()
     counters = dict(gt_cells_verified=0,gt_cells_reused=0)
     compute_seconds,wait_seconds = 0.,0.
-    network_keys = ('masks','sdf','phases','view_present','annotated')
+    network_keys = ('masks','sdf','phases','view_present','annotated','pose_gt','pixel_spacing','norm_to_mm')
     with tqdm(total=count,desc='Validation',leave=False,dynamic_ncols=True,
               mininterval=1.,disable=not progress) as bar:
         def finish():
@@ -436,13 +526,14 @@ def evaluate_with_runtime(model,dataset,device,*,cases,exact,progress,runtime):
             bar.update()
         for index,(batch,source,key) in runtime.batches(count):
             t0 = time.perf_counter()
-            # Pose/native labels stay on CPU. Only network observations and
-            # the 3D GT needed by reconstruction_metrics reach CUDA.
+            # Acquisition geometry is an observation; native labels stay on CPU.
             observations = {key:to_device(value,device) if key in network_keys else value
                             for key,value in batch.items()}
             output = model(observations)
             metrics = reconstruction_metrics(output['vertices_4d'],batch['vertices_gt'],model.chamber_ranges,model.faces)
             item = dict(case_id=batch['case_id'][0],metrics=metrics)
+            if model.regional_motion:
+                item['regional_motion'] = regional_motion_diagnostics(output)
             if exact:
                 prediction = output['vertices_4d'].detach().cpu().numpy()
                 compute_seconds += time.perf_counter()-t0
@@ -470,6 +561,7 @@ def main():
     parser.add_argument('--device')
     parser.add_argument('--output',type=Path)
     parser.add_argument('--resume',type=Path)
+    parser.add_argument('--initialize',type=Path,help='Audited inherited weights for matched-budget experiments; new optimizer')
     parser.add_argument('--max-steps',type=int)
     parser.add_argument('--max-cases',type=int)
     parser.add_argument('--val-cases',type=int)
@@ -490,6 +582,8 @@ def main():
     parser.add_argument('--slice-cell-chunk',type=int,default=16,
                         help='Maximum section cells per batched slice group; controls temporary GPU memory')
     args = parser.parse_args()
+    if sum(value is not None for value in (args.resume,args.initialize,args.evaluate)) > 1:
+        parser.error('--resume, --initialize and --evaluate are mutually exclusive')
     if args.eval_workers<0 or args.eval_cache_cases<1:
         parser.error('Evaluation workers must be nonnegative and cache size positive')
     if (args.train_workers is not None and args.train_workers<0) or args.train_prefetch<1:
@@ -541,8 +635,11 @@ def main():
         epoch,offset,step = saved['epoch'],saved['sample_offset'],saved['step']
     else:
         model = build_model(train,config).to(device)
+        if args.initialize:
+            initialization = initialize_from_checkpoint(model,args.initialize,identity)
+            (output_dir/'initialization.json').write_text(json.dumps(initialization,indent=2)+'\n')
     (output_dir/'config.yaml').write_text(yaml.safe_dump(config,sort_keys=False))
-    optimizer = torch.optim.Adam(model.parameters(),lr=training['learning_rate'])
+    optimizer = make_optimizer(model,training)
     if args.resume:
         optimizer.load_state_dict(saved['optimizer'])
         restore_rng(saved,device)
@@ -561,7 +658,7 @@ def main():
             stage = args.stage or stage_for_epoch(epoch,config)
             rate = learning_rate_for_epoch(epoch,config,stage)
             for group in optimizer.param_groups:
-                group['lr'] = rate
+                group['lr'] = rate*group.get('learning_rate_scale',1.)
             generator = torch.Generator().manual_seed(training['seed']+epoch)
             order = torch.randperm(count,generator=generator).tolist()
             loader = training_loader(train,order[offset:],batch_size=training['batch_size'],
@@ -598,6 +695,12 @@ def main():
                         terms=dict(zip(term_keys,loss_scalars[1:])),
                         active_weights=losses['active_weights'],units=losses['units'],seconds=time.perf_counter()-start)
                     record['io_wait_seconds'] = io_wait
+                    if model.regional_motion:
+                        grids = decoded['control_grids']['regional_motion'].detach()
+                        record['regional_motion'] = dict(
+                            increment_displacement_rms_mm=decoded['regional_motion_rms_mm'].detach().square().mean((0,1)).sqrt().cpu().tolist(),
+                            control_rms_mm=grids.square().mean((0,1,3,4,5,6)).sqrt().cpu().tolist(),
+                            adjacent_control_change_rms_mm=grids.diff(dim=1).square().mean((0,1,3,4,5,6)).sqrt().cpu().tolist())
                     compute_seconds += record['seconds']
                     processed_samples += batch_cases
                     if slices is not None:
@@ -627,6 +730,7 @@ def main():
                 train_mean_loss=loss_sum/loss_samples,train_samples=loss_samples,
                 validation=validation_summary(report),seconds=time.perf_counter()-epoch_start)
             summary['learning_rate'] = rate
+            summary['optimizer_group_learning_rates'] = [group['lr'] for group in optimizer.param_groups]
             if training.get('save_best',False):
                 for name,candidate in best_checkpoint_candidates(summary).items():
                     if name not in best or candidate['score']<best[name]['score']:

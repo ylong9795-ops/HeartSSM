@@ -24,7 +24,7 @@ class NeuralTestCase(unittest.TestCase):
         torch.set_num_threads(1)
 
 
-def small_model(frames=4):
+def small_model(frames=4,regional_motion=False):
     import trimesh
     mesh = trimesh.creation.icosphere(subdivisions=1,radius=2.)
     vertices = torch.cat([torch.tensor(mesh.vertices,dtype=torch.float32)+torch.tensor(center)
@@ -32,14 +32,73 @@ def small_model(frames=4):
     count = len(mesh.vertices)
     ranges = torch.tensor([[i*count,(i+1)*count] for i in range(4)])
     faces = {c:torch.tensor(mesh.faces.copy()) for c in ('LV','LA','RV','RA')}
+    regional = {}
+    if regional_motion:
+        centers = torch.tensor([[-3.,-3.,0.],[-3.,3.,0.],[3.,-3.,0.],[3.,3.,0.]])
+        regional = dict(regional_motion=True,regional_motion_lower_mm=(centers-6).tolist(),
+                        regional_motion_upper_mm=(centers+6).tolist(),regional_motion_hidden=8)
     return NeuralFFDNet(vertices,ranges,faces,template_sha256='fixture-template',asset_sha256='fixture-asset',norm_to_mm=1.,
         encoder_config=dict(shape_dim=12,motion_dim=4,width=16,heads=2,temporal_layers=1,
                             spatial_sides=(4,2),query_slots=2,cnn_chunk_size=4),
         decoder_config=dict(frames=frames,channels=4,seed_shape=(4,4,4),global_shape_dim=4,
-                            lower_mm=(-10.,-10.,-10.),upper_mm=(10.,10.,10.)))
+                            lower_mm=(-10.,-10.,-10.),upper_mm=(10.,10.,10.),**regional))
 
 
 class DecoderTests(NeuralTestCase):
+    def test_regional_motion_support_units_and_domain_failures(self):
+        net = small_model(regional_motion=True)
+        v = net.template_vertices_mm[None]
+        controls = torch.zeros(1,4,5,5,5,3)
+        controls[:,2,...,1] = 1.25
+        changed,rms = net.apply_motion_regions(v,controls)
+        torch.testing.assert_close(changed[:,84:126,1]-v[:,84:126,1],torch.full((1,42),1.25))
+        self.assertTrue(torch.equal(changed[:,:84],v[:,:84]))
+        self.assertTrue(torch.equal(changed[:,126:],v[:,126:]))
+        torch.testing.assert_close(rms,torch.tensor([[0.,0.,1.25,0.]]))
+        with self.assertRaisesRegex(ValueError,'support domain'):
+            net.apply_motion_regions(v+100,controls)
+        controls[0,0,0,0,0,0] = float('nan')
+        with self.assertRaisesRegex(ValueError,'finite'):
+            net.apply_motion_regions(v,controls)
+
+    def test_regional_motion_24_frames_initial_equivalence_and_latent_gradients(self):
+        net = small_model(frames=24,regional_motion=True)
+        z,m = torch.randn(1,12,requires_grad=True),torch.randn(1,4,requires_grad=True)
+        output = net.decode_4d(z,m,return_details=True)
+        self.assertEqual(output['vertices_4d'].shape,(1,24,168,3))
+        self.assertEqual(output['control_grids']['regional_motion'].shape,(1,24,4,5,5,5,3))
+        self.assertTrue(torch.equal(output['vertices_ref'],net.decode_shape(z)))
+        net.regional_motion = False
+        initial = net.decode_4d(z,m)
+        net.regional_motion = True
+        self.assertTrue(torch.equal(initial,output['vertices_4d']))
+        # One ordinary update opens the inner/latent path from a zero output.
+        optimizer = torch.optim.Adam(net.regional_motion_heads.parameters(),lr=.001)
+        desired = output['vertices_4d'].detach().clone()
+        desired[:,1:,84:126,0] += .2
+        loss = (output['vertices_4d']-desired).square().mean()
+        loss.backward()
+        self.assertGreater(float(net.regional_motion_heads[2][-1].weight.grad.norm()),0.)
+        optimizer.step();optimizer.zero_grad(set_to_none=True)
+        updated = net.decode_4d(z,m,return_details=True)
+        region_controls = updated['control_grids']['regional_motion'][:,1:]
+        gradients = torch.autograd.grad(region_controls.square().sum(),
+            (m,z,net.regional_motion_heads[2][0].weight),retain_graph=True)
+        for grad in gradients:
+            self.assertTrue(torch.isfinite(grad).all())
+            self.assertGreater(float(grad.norm()),0.)
+        self.assertTrue(torch.equal(updated['vertices_ref'],output['vertices_ref']))
+        self.assertTrue(torch.isfinite(updated['vertices_4d']).all())
+        for c in net.faces:
+            self.assertTrue(torch.equal(net.faces[c],self.net.faces[c]))
+        criterion = NeuralFFDLoss(net.chamber_ranges,net.faces,weights={'slice':0.})
+        losses = criterion(updated,desired,control_spacings_mm=net.control_spacings_mm,
+            regional_spacing_mm=net.regional_spacing_mm,regional_motion_spacings_mm=net.regional_motion_spacings_mm)
+        self.assertTrue(torch.isfinite(losses['total']))
+        control_gradient = torch.autograd.grad(losses['terms']['control'],net.regional_motion_heads[2][-1].weight)[0]
+        self.assertTrue(torch.isfinite(control_gradient).all())
+        self.assertGreater(float(control_gradient.norm()),0.)
+
     def setUp(self):
         torch.set_num_threads(2)
         torch.manual_seed(3)
@@ -183,6 +242,89 @@ class SliceTests(NeuralTestCase):
 
 
 class CheckpointTests(NeuralTestCase):
+    def test_geometry_optimizer_preserves_inherited_rate_and_resume(self):
+        from train_neural_ffd import make_optimizer
+        old = small_model()
+        model = NeuralFFDNet(old.template_vertices_mm,old.chamber_ranges,old.faces,
+            template_sha256=old.template_sha256,asset_sha256=old.asset_sha256,norm_to_mm=old.norm_to_mm,
+            encoder_config=dict(old.encoder_config,known_pose=True),decoder_config=old.decoder_config)
+        settings = dict(learning_rate=1e-5,geometry_learning_rate_multiplier=100.)
+        optimizer = make_optimizer(model,settings)
+        projection = model.encoder.geometry_projection.weight
+        self.assertEqual(optimizer.param_groups[1]['params'],[projection])
+        self.assertEqual([g['lr'] for g in optimizer.param_groups],[1e-5,1e-3])
+        inherited = model.encoder.stem[0].weight
+        before = inherited.detach().clone()
+        inherited.grad,projection.grad = torch.ones_like(inherited),torch.ones_like(projection)
+        optimizer.step()
+        torch.testing.assert_close((before-inherited).abs().mean(),torch.tensor(1e-5),rtol=2e-3,atol=1e-8)
+        torch.testing.assert_close(projection.abs().mean(),torch.tensor(1e-3))
+        resumed = make_optimizer(model,settings)
+        resumed.load_state_dict(optimizer.state_dict())
+        self.assertEqual(resumed.param_groups[1]['learning_rate_scale'],100.)
+        self.assertEqual([g['lr'] for g in resumed.param_groups],[1e-5,1e-3])
+        self.assertEqual(len(make_optimizer(old,dict(learning_rate=1e-5)).param_groups),1)
+        with self.assertRaisesRegex(ValueError,'known-pose'):
+            make_optimizer(old,settings)
+
+    def test_training_config_rejects_unimplemented_options(self):
+        import copy
+        import yaml
+        from train_neural_ffd import load_config
+        path = Path(__file__).resolve().parents[1]/'configs/neural_ffd_1k_known_pose_regional.yaml'
+        config,_ = load_config(path)
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory)/'config.yaml'
+            for section,key in (('training','geometry_learning_rate'),(None,'pose_framework')):
+                wrong = copy.deepcopy(config)
+                if section is None:
+                    wrong[key] = {}
+                else:
+                    wrong[section][key] = 1e-3
+                candidate.write_text(yaml.safe_dump(wrong))
+                with self.assertRaisesRegex(ValueError,'Unknown'):
+                    load_config(candidate)
+
+    def test_regional_motion_initialization_and_fixed_buffer_integrity(self):
+        from train_neural_ffd import save_checkpoint,initialize_from_checkpoint,load_checkpoint
+        torch.set_num_threads(2)
+        old,current = small_model(),small_model(regional_motion=True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'fixture.pth'
+            save_checkpoint(path,old,None,config={},identity={'split':'fixed'})
+            result = initialize_from_checkpoint(current,path,{'split':'fixed'})
+            self.assertTrue(all(key.startswith('regional_motion') for key in result['new_keys']))
+            for key,value in old.state_dict().items():
+                self.assertTrue(torch.equal(value,current.state_dict()[key]),key)
+            save_checkpoint(path,current,None,config={},identity={'split':'fixed'})
+            restored,saved = load_checkpoint(path)
+            self.assertTrue(restored.regional_motion)
+            saved['model']['regional_motion_origins_mm'][0,0] += 1
+            torch.save(saved,path)
+            with self.assertRaisesRegex(ValueError,'fixed control/topology buffer'):
+                load_checkpoint(path)
+
+    def test_audited_known_pose_initialization_preserves_all_old_weights(self):
+        from train_neural_ffd import save_checkpoint,initialize_from_checkpoint
+        torch.set_num_threads(2)
+        old = small_model()
+        current = NeuralFFDNet(old.template_vertices_mm,old.chamber_ranges,old.faces,
+            template_sha256=old.template_sha256,asset_sha256=old.asset_sha256,norm_to_mm=old.norm_to_mm,
+            encoder_config=dict(old.encoder_config,known_pose=True),decoder_config=old.decoder_config)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'old.pth'
+            save_checkpoint(path,old,None,config={},identity={'split':'fixed'},step=800)
+            result = initialize_from_checkpoint(current,path,{'split':'fixed'})
+            self.assertEqual(result['new_keys'],['encoder.geometry_projection.weight'])
+            self.assertEqual(result['source_step'],800)
+            for key,value in old.state_dict().items():
+                self.assertTrue(torch.equal(value,current.state_dict()[key]),key)
+            with self.assertRaisesRegex(ValueError,'identical source data'):
+                initialize_from_checkpoint(current,path,{'split':'wrong'})
+            current.encoder_config['shape_dim'] = 999
+            with self.assertRaisesRegex(ValueError,'configuration'):
+                initialize_from_checkpoint(current,path,{'split':'fixed'})
+
     def test_long_schedule_rates_and_independent_checkpoint_selection(self):
         from train_neural_ffd import learning_rate_for_epoch,stage_for_epoch,best_checkpoint_candidates,format_epoch_summary
         config = dict(training=dict(epochs=180,shape_epochs=30,motion_epochs=30,
@@ -263,6 +405,78 @@ def observations(batch=2, frames=4, side=32):
 
 
 class EncoderTests(NeuralTestCase):
+    def test_known_pose_geometry_sampling_units_and_failures(self):
+        torch.set_num_threads(2)
+        net = MultiViewTemporalEncoder(width=16,heads=2,temporal_layers=1,
+            spatial_sides=(14,7),query_slots=2,known_pose=True)
+        x = observations(batch=1,frames=2,side=224)
+        x.update(norm_to_mm=torch.tensor([10.]),pixel_spacing=torch.tensor([1.,2.])[None,None,None].repeat(1,2,3,1),
+            pose_gt=dict(probe_R=torch.eye(3)[None,None,None].repeat(1,2,3,1,1),
+                         probe_t=torch.tensor([1.,2.,3.])[None,None,None].repeat(1,2,3,1),
+                         probe_s=torch.ones(1,2,3,3)))
+        for scale,(side,first,stride) in enumerate(((14,4,16),(7,8,32))):
+            geometry = net.geometry_features(x,(224,224),scale)
+            self.assertEqual(geometry.shape,(1,2,3,side*side,6))
+            expected = torch.tensor([10.+(first-112)*2,20.+first-112,30.])
+            torch.testing.assert_close(geometry[0,0,0,0,:3]*100,expected)
+            # Round trip through the slice operator's (X-t)@R convention.
+            local = (geometry[...,:3]*100-10*x['pose_gt']['probe_t'][...,None,:])@torch.eye(3)
+            torch.testing.assert_close(local[...,2],torch.zeros_like(local[...,2]),atol=3e-6,rtol=0)
+            torch.testing.assert_close(local[0,0,0,1,0]-local[0,0,0,0,0],torch.tensor(float(stride*2)))
+            torch.testing.assert_close(geometry[...,3:],torch.tensor([0.,0.,1.]).expand_as(geometry[...,3:]))
+        x['pose_gt']['probe_R'][0,0,0] = torch.tensor([[0.,-1.,0.],[1.,0.,0.],[0.,0.,1.]])
+        point = net.geometry_features(x,(224,224),0)[0,0,0,0,:3]*100
+        torch.testing.assert_close(point,torch.tensor([118.,-196.,30.]))
+        for key in ('pose_gt','pixel_spacing','norm_to_mm'):
+            with self.assertRaisesRegex(ValueError,'requires'):
+                net.geometry_features({k:v for k,v in x.items() if k!=key},(224,224),0)
+        x['pose_gt']['probe_R'][0,0,0,0,0] = 2.
+        with self.assertRaisesRegex(ValueError,'orthonormal'):
+            net.geometry_features(x,(224,224),0)
+
+    def test_known_pose_both_paths_gradients_and_collation(self):
+        from train_neural_ffd import training_collate
+        torch.set_num_threads(2)
+        net = MultiViewTemporalEncoder(shape_dim=12,motion_dim=4,width=16,heads=2,
+            temporal_layers=1,spatial_sides=(4,2),query_slots=2,known_pose=True,
+            feature_transfer='direct_residual_v1').eval()
+        x = observations(batch=1)
+        x.update(norm_to_mm=torch.ones(1),pixel_spacing=torch.ones(1,4,3,2),
+                 pose_gt=dict(probe_R=torch.eye(3)[None,None,None].repeat(1,4,3,1,1),
+                              probe_t=torch.zeros(1,4,3,3),probe_s=torch.ones(1,4,3,3)))
+        for shape_gain,frame_gain in ((1.,1.),(0.,0.)):
+            net.direct_shape_gain,net.direct_frame_gain = shape_gain,frame_gain
+            codes = net(x)
+            for key in ('z_shape','z_motion'):
+                grad = torch.autograd.grad(codes[key].square().sum(),net.geometry_projection.weight,retain_graph=True)[0]
+                self.assertTrue(torch.isfinite(grad).all())
+                self.assertGreater(float(grad.norm()),0.)
+        # Direct descriptor itself receives the same projected geometry, with
+        # absent views zeroed after conditioning.
+        geometry = net.geometry_projection(net.geometry_features(x,(32,32),0))
+        self.assertEqual(geometry.shape,(1,4,3,16,16))
+        value = geometry.reshape(12,16,16).transpose(1,2).reshape(12,16,4,4)
+        pooled = net.direct_descriptors((value,torch.zeros(12,16,2,2)),torch.ones(4,3,dtype=torch.bool))
+        grad = torch.autograd.grad(net.direct_frame_projection(pooled).sum(),net.geometry_projection.weight)[0]
+        self.assertGreater(float(grad.norm()),0.)
+        sample = dict(pose_gt={k:v[0] for k,v in x['pose_gt'].items()},pixel_spacing=x['pixel_spacing'][0])
+        for stage in ('shape','motion','joint'):
+            batch = training_collate([sample],stage)
+            self.assertIn('pose_gt',batch)
+            self.assertIn('pixel_spacing',batch)
+        from types import SimpleNamespace
+        with torch.no_grad():
+            net.geometry_projection.weight.fill_(.02)
+            baseline = net(x)
+            with EncoderDiagnostics(SimpleNamespace(encoder=net)) as monitor:
+                measured = net(x)
+                summary = monitor.summary()
+            for key in baseline:
+                self.assertTrue(torch.equal(baseline[key],measured[key]))
+            self.assertTrue(summary['known_pose'])
+            self.assertGreater(summary['rms']['geometry_embedding'],0.)
+            self.assertTrue(all(not module._forward_hooks for module in net.modules()))
+
     def test_integrated_diagnostics_preserve_latents_and_release_hooks(self):
         from types import SimpleNamespace
         torch.set_num_threads(2)
@@ -473,6 +687,29 @@ class BatchedSliceTests(unittest.TestCase):
         obs['pose_gt']['probe_R'][0,0,0,0,0] = 2
         with self.assertRaisesRegex(ValueError,'orthonormal'):
             fast(predicted,obs)
+
+    def test_paired_soft_targets_stationary_at_gt_and_serial_batched_parity(self):
+        predicted,obs,ranges,faces = self.fixture()
+        obs['vertices_gt'] = (predicted-torch.tensor([.11,-.07,.02],dtype=torch.double)).detach()
+        results,gradients = [],[]
+        for backend in ('serial','batched'):
+            slicer = MeshSliceSupervisor(ranges,faces,2.5,sigma_mm=.4,pixel_stride=2,chunk_size=31,
+                execution_backend=backend,target_mode='paired_soft_geometry_v1')
+            exact_gt = obs['vertices_gt'].clone().requires_grad_()
+            result = slicer(exact_gt,obs)
+            grad = torch.autograd.grad(result['total'],exact_gt)[0]
+            self.assertLess(abs(float(result['total'])),1e-12)
+            self.assertLess(float(grad.norm()),1e-12)
+            value = predicted.clone().requires_grad_()
+            perturbed = slicer(value,obs)
+            gradient = torch.autograd.grad(perturbed['total'],value)[0]
+            self.assertGreater(float(perturbed['total']),0.)
+            self.assertGreater(float(gradient.norm()),0.)
+            results.append(perturbed)
+            gradients.append(gradient)
+        for key in ('total','dice','bce','boundary_mm'):
+            torch.testing.assert_close(results[0][key],results[1][key],atol=1e-11,rtol=1e-10)
+        torch.testing.assert_close(gradients[0],gradients[1],atol=1e-11,rtol=1e-10)
 
 
 if __name__ == '__main__':

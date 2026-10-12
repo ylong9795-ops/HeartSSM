@@ -194,7 +194,8 @@ def section_soft_mask(vertices_mm, faces, rotation, translation_mm, pixel_spacin
 class MeshSliceSupervisor(nn.Module):
     def __init__(self, chamber_ranges, faces, norm_to_mm, *, sigma_mm=1., pixel_stride=4,
                  chunk_size=256, dice_weight=1., bce_weight=.1, boundary_weight=.1,
-                 execution_backend='serial', cell_chunk_size=16):
+                 execution_backend='serial', cell_chunk_size=16,
+                 target_mode='binary_native_v1'):
         super().__init__()
         self.register_buffer('chamber_ranges',torch.as_tensor(chamber_ranges).long().clone())
         self._ranges = tuple(map(tuple,self.chamber_ranges.cpu().tolist()))
@@ -207,10 +208,31 @@ class MeshSliceSupervisor(nn.Module):
         if execution_backend not in ('serial','batched') or cell_chunk_size<1:
             raise ValueError('Slice backend must be serial/batched with positive cell chunk size')
         self.execution_backend,self.cell_chunk_size = execution_backend,cell_chunk_size
+        if target_mode not in ('binary_native_v1','paired_soft_geometry_v1'):
+            raise ValueError('Unknown slice supervision target mode')
+        self.target_mode = target_mode
         self.weights = dict(dice=dice_weight,bce=bce_weight,boundary_mm=boundary_weight)
         if (min(self.weights.values())<0 or sum(self.weights.values())<=0
                 or not np.isfinite(norm_to_mm) or norm_to_mm<=0):
             raise ValueError('Nonnegative informative slice loss weights and physical scale required')
+
+    def _terms(self,logits,truth,field,teacher_soft=None):
+        """Same renderer, optional detached continuous GT target; no label edits.
+
+        Squared-denominator soft Dice and Bernoulli KL have zero derivative
+        when prediction equals continuous GT. Original fillPoly/binary Dice
+        remains the independent, unchanged hard evaluation contract.
+        """
+        p = torch.sigmoid(logits)
+        if teacher_soft is None:
+            return dict(dice=1-(2*(p*truth).sum(-1)+1)/(p.sum(-1)+truth.sum(-1)+1),
+                bce=F.binary_cross_entropy_with_logits(logits,truth,reduction='none').mean(-1),
+                boundary_mm=((p-truth).abs()*field.abs()).mean(-1))
+        q = teacher_soft.detach()
+        return dict(dice=1-(2*(p*q).sum(-1)+1)/(p.square().sum(-1)+q.square().sum(-1)+1),
+            bce=(F.binary_cross_entropy_with_logits(logits,q,reduction='none')-
+                 (torch.special.entr(q)+torch.special.entr(1-q))).mean(-1),
+            boundary_mm=((p-q).abs()*field.abs()).mean(-1))
 
     def forward(self, vertices_4d, observations):
         if vertices_4d.ndim!=4 or vertices_4d.shape[-1]!=3:
@@ -227,8 +249,15 @@ class MeshSliceSupervisor(nn.Module):
         spacings = observations['pixel_spacing'].to(vertices_4d)
         if rotations.shape!=(b,t,3,3,3) or translations.shape!=(b,t,3,3) or spacings.shape!=(b,t,3,2):
             raise ValueError('Pose/time/pixel-grid contract mismatch')
+        gt = None
+        if self.target_mode == 'paired_soft_geometry_v1':
+            if 'vertices_gt' not in observations:
+                raise ValueError('Paired soft slice targets require complete synthetic GT supervision')
+            gt = observations['vertices_gt'].to(vertices_4d).detach()
+            if gt.shape != vertices_4d.shape or not torch.isfinite(gt).all():
+                raise ValueError('Paired soft slice targets require finite matching GT topology/phases')
         if self.execution_backend=='batched':
-            return self._batched_forward(vertices_4d,masks,sdf,valid,rotations,translations,spacings)
+            return self._batched_forward(vertices_4d,masks,sdf,valid,rotations,translations,spacings,gt)
         values = {key:[] for key in self.weights}
         matched_empty = 0
         for patient,frame,view,chamber in valid.nonzero().tolist():
@@ -251,10 +280,18 @@ class MeshSliceSupervisor(nn.Module):
                 for key in values:
                     values[key].append(vertices_4d[patient,frame,left:right].sum()*0)
                 continue
-            p = rendered['soft_mask']
-            values['dice'].append(1-(2*(p*target).sum()+1)/(p.sum()+target.sum()+1))
-            values['bce'].append(F.binary_cross_entropy_with_logits(rendered['logits'],target))
-            values['boundary_mm'].append(((p-target).abs()*field.abs()).mean())
+            teacher_soft = None
+            if gt is not None:
+                with torch.no_grad():
+                    teacher = section_soft_mask(gt[patient,frame,left:right],getattr(self,'faces_'+CHAMBERS[chamber]),
+                        rotations[patient,frame,view],translations[patient,frame,view],spacings[patient,frame,view],masks.shape[-2:],
+                        sigma_mm=self.sigma_mm,pixel_stride=self.pixel_stride,chunk_size=self.chunk_size,
+                        require_intersection=bool(masks[patient,frame,view,chamber].any()))
+                    teacher_soft = teacher['soft_mask']
+            terms = self._terms(rendered['logits'].flatten()[None],target.flatten()[None],field.flatten()[None],
+                None if teacher_soft is None else teacher_soft.flatten()[None])
+            for key,value in terms.items():
+                values[key].append(value[0])
         cells = int(valid.sum())
         if not cells or matched_empty==cells:
             raise ValueError('No informative plane sections in the supervised batch')
@@ -263,11 +300,12 @@ class MeshSliceSupervisor(nn.Module):
         result['diagnostics'] = dict(valid_cells=cells,matched_empty_sections=matched_empty,
                                      intersecting_cells=cells-matched_empty,pixel_stride=self.pixel_stride,
                                      soft_boundary_width_mm=self.sigma_mm)
+        result['diagnostics']['target_mode'] = self.target_mode
         if not torch.isfinite(result['total']):
             raise ValueError('Nonfinite slice supervision')
         return result
 
-    def _batched_forward(self, vertices, masks, sdf, valid, rotations, translations, spacings):
+    def _batched_forward(self, vertices, masks, sdf, valid, rotations, translations, spacings,gt=None):
         # Validate once instead of synchronizing CPU/GPU for every cell.
         active_views = valid.any(-1)
         r,tr,spacing = rotations[active_views],translations[active_views],spacings[active_views]
@@ -311,9 +349,17 @@ class MeshSliceSupervisor(nn.Module):
                 p = torch.sigmoid(logits)
                 truth = target[patient,frame,view,chamber].flatten(1)
                 s = field[patient,frame,view,chamber].flatten(1)
-                terms = dict(dice=1-(2*(p*truth).sum(-1)+1)/(p.sum(-1)+truth.sum(-1)+1),
-                    bce=F.binary_cross_entropy_with_logits(logits,truth,reduction='none').mean(-1),
-                    boundary_mm=((p-truth).abs()*s.abs()).mean(-1))
+                teacher_soft = None
+                if gt is not None:
+                    with torch.no_grad():
+                        teacher_segments,teacher_present = batched_plane_segments(gt[patient,frame,left:right],
+                            getattr(self,'faces_'+CHAMBERS[chamber]),rotations[patient,frame,view],translations[patient,frame,view])
+                        if (foreground[patient,frame,view,chamber] & ~teacher_present.any(-1)).any():
+                            raise MissingSectionError('GT soft section is absent in an observed foreground cell')
+                        teacher_distance = batched_signed_segment_distance(points,teacher_segments,teacher_present,self.chunk_size)
+                        teacher_soft = torch.where(teacher_present.any(-1)[:,None],
+                            torch.sigmoid(-teacher_distance/self.sigma_mm),0.)
+                terms = self._terms(logits,truth,s,teacher_soft)
                 # Empty/empty cells contribute graph-connected zero, just as serial.
                 for key,value in terms.items():
                     values[key].append(torch.where(intersects,value,0.).sum())
@@ -325,6 +371,7 @@ class MeshSliceSupervisor(nn.Module):
         result['diagnostics'] = dict(valid_cells=len(cells),matched_empty_sections=empty_count,
             intersecting_cells=len(cells)-empty_count,pixel_stride=self.pixel_stride,
             soft_boundary_width_mm=self.sigma_mm)
+        result['diagnostics']['target_mode'] = self.target_mode
         if not torch.isfinite(result['total']):
             raise ValueError('Nonfinite slice supervision')
         return result

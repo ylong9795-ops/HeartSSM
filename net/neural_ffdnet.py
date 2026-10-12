@@ -79,7 +79,10 @@ class NeuralFFDNet(nn.Module):
         self.shape_dim, self.motion_dim = self.encoder.shape_dim, self.encoder.motion_dim
         settings = dict(frames=24, channels=32, seed_shape=(6,6,8),
                         lower_mm=(-120.,-110.,-110.), upper_mm=(120.,110.,110.),
-                        regional_shape=True, global_shape_dim=32, regional_grid_shape=(4,4,4))
+                        regional_shape=True, global_shape_dim=32, regional_grid_shape=(4,4,4),
+                        regional_motion=False,regional_motion_grid_shape=(5,5,5),
+                        regional_motion_lower_mm=None,regional_motion_upper_mm=None,
+                        regional_motion_hidden=32)
         unknown = set(self.decoder_config)-set(settings)
         if unknown:
             raise ValueError('Unknown decoder settings: '+str(sorted(unknown)))
@@ -90,6 +93,9 @@ class NeuralFFDNet(nn.Module):
         if self.frames < 2 or channels < 1 or len(self.seed_shape)!=3 or min(self.seed_shape)<4:
             raise ValueError('At least two phases and a 3D seed >=4 nodes per axis required')
         self.regional_shape = settings['regional_shape']
+        self.regional_motion = settings['regional_motion']
+        if type(self.regional_motion) is not bool or (self.regional_motion and not self.regional_shape):
+            raise ValueError('Regional motion requires the existing chamber Shape code partition')
         self.global_shape_dim = settings['global_shape_dim'] if self.regional_shape else self.shape_dim
         if (self.global_shape_dim < 1 or self.global_shape_dim > self.shape_dim
                 or (self.regional_shape and (self.shape_dim-self.global_shape_dim < 4
@@ -142,6 +148,34 @@ class NeuralFFDNet(nn.Module):
                                                 for _ in CHAMBERS])
             for head in self.regional_heads:
                 _small_output(head)
+        if self.regional_motion:
+            self.regional_motion_grid_shape = tuple(settings['regional_motion_grid_shape'])
+            hidden = settings['regional_motion_hidden']
+            if (len(self.regional_motion_grid_shape)!=3 or any(type(n) is not int or n<4 for n in self.regional_motion_grid_shape)
+                    or type(hidden) is not int or hidden<1
+                    or settings['regional_motion_lower_mm'] is None or settings['regional_motion_upper_mm'] is None):
+                raise ValueError('Regional motion requires explicit fixed physical boxes and small integer grids/hidden dimension')
+            region_lower = torch.as_tensor(settings['regional_motion_lower_mm'],dtype=torch.float32)
+            region_upper = torch.as_tensor(settings['regional_motion_upper_mm'],dtype=torch.float32)
+            if region_lower.shape!=(4,3) or region_upper.shape!=(4,3):
+                raise ValueError('Regional motion bounds must be [4,3] in LV/LA/RV/RA order, mm')
+            geometries = [control_geometry(lo,hi,self.regional_motion_grid_shape) for lo,hi in zip(region_lower,region_upper)]
+            for i,(left,right) in enumerate(ranges.tolist()):
+                if ((template[left:right]<region_lower[i])|(template[left:right]>region_upper[i])).any():
+                    raise ValueError('Template chamber outside its fixed regional motion support')
+            self.register_buffer('regional_motion_lower_mm',region_lower)
+            self.register_buffer('regional_motion_upper_mm',region_upper)
+            self.register_buffer('regional_motion_origins_mm',torch.stack([g[0] for g in geometries]))
+            self.register_buffer('regional_motion_spacings_mm',torch.stack([g[1] for g in geometries]))
+            self.regional_motion_heads = nn.ModuleList([
+                nn.Sequential(nn.Linear(self.motion_dim+self.chamber_dim+channels,hidden),nn.SiLU(),
+                              nn.Linear(hidden,math.prod(self.regional_motion_grid_shape)*3)) for _ in CHAMBERS])
+            for head in self.regional_motion_heads:
+                # Exactly preserve the inherited trajectory at initialization.
+                # Output layers train immediately; inner/latent regional paths
+                # gain gradients after that first ordinary optimizer update.
+                nn.init.zeros_(head[-1].weight)
+                nn.init.zeros_(head[-1].bias)
 
     @property
     def faces(self):
@@ -214,15 +248,40 @@ class NeuralFFDNet(nn.Module):
     def decode_shape(self, z_shape):
         return self._reference(z_shape)[0]
 
+    def apply_motion_regions(self,vertices,controls):
+        """Smooth mm increments with fixed chamber supports and fixed domains."""
+        if not self.regional_motion or controls.shape != (vertices.shape[0],4,*self.regional_motion_grid_shape,3):
+            raise ValueError('Four fixed regional motion control fields required')
+        parts,displacement_rms = [],[]
+        for i,(left,right) in enumerate(self.chamber_ranges.tolist()):
+            v = vertices[:,left:right]
+            delta = bspline_ffd_physical(v,controls[:,i],self.regional_motion_origins_mm[i],self.regional_motion_spacings_mm[i])
+            parts.append(v+delta)
+            displacement_rms.append(delta.square().sum(-1).mean(-1).sqrt())
+        return torch.cat(parts,1),torch.stack(displacement_rms,-1)
+
     def decode_4d(self, z_shape, z_motion, *, return_details=False):
         self._check_latent(z_motion,self.motion_dim)
         if z_shape.shape[0]!=z_motion.shape[0]:
             raise ValueError('Shape and motion batches differ')
         reference,h,coarse,medium,fine,regions = self._reference(z_shape)
         trajectory,fields = [reference],[fine]
+        regional_fields,regional_rms = [],[]
+        if self.regional_motion:
+            codes = z_shape[:,self.global_shape_dim:].reshape(z_shape.shape[0],4,self.chamber_dim)
+            regional_fields.append(reference.new_zeros(z_shape.shape[0],4,*self.regional_motion_grid_shape,3))
+            regional_rms.append(reference.new_zeros(z_shape.shape[0],4))
         for phase in range(self.frames-1):
             field = self.deform3.motion_field(h,z_shape,z_motion,phase)
-            trajectory.append(self._deform(trajectory[-1],field,2))
+            updated = self._deform(trajectory[-1],field,2)
+            if self.regional_motion:
+                time = self.deform3.phase_embedding.weight[phase][None].expand(z_shape.shape[0],-1)
+                controls = torch.stack([head(torch.cat((z_motion,codes[:,i],time),-1)).reshape(
+                    z_shape.shape[0],*self.regional_motion_grid_shape,3) for i,head in enumerate(self.regional_motion_heads)],1)
+                updated,rms = self.apply_motion_regions(updated,controls)
+                regional_fields.append(controls)
+                regional_rms.append(rms)
+            trajectory.append(updated)
             fields.append(field)
         vertices = torch.stack(trajectory,1)
         if not torch.isfinite(vertices).all():
@@ -230,7 +289,9 @@ class NeuralFFDNet(nn.Module):
         if not return_details:
             return vertices
         return dict(vertices_ref=reference,vertices_4d=vertices,
-                    control_grids=dict(coarse=coarse,medium=medium,fine_motion=torch.stack(fields,1),regions=regions))
+                    regional_motion_rms_mm=torch.stack(regional_rms,1) if self.regional_motion else None,
+                    control_grids=dict(coarse=coarse,medium=medium,fine_motion=torch.stack(fields,1),regions=regions,
+                        regional_motion=torch.stack(regional_fields,1) if self.regional_motion else None))
 
     def forward(self, observations):
         latents = self.encode(observations)

@@ -66,7 +66,7 @@ class NeuralFFDLoss(nn.Module):
         return vertices-neighbors/getattr(self,'degree_'+chamber)[:,None]
 
     def forward(self, output, vertices_gt, *, slice_result=None, control_spacings_mm=None,
-                regional_spacing_mm=None, stage='joint'):
+                regional_spacing_mm=None, regional_motion_spacings_mm=None, stage='joint'):
         p,g = output['vertices_4d'],vertices_gt.to(output['vertices_4d']).detach()
         if (p.shape!=g.shape or p.ndim!=4 or p.shape[-1]!=3 or p.shape[-2]!=self.chamber_ranges[-1,1]
                 or not torch.isfinite(p).all() or not torch.isfinite(g).all()):
@@ -111,6 +111,14 @@ class NeuralFFDLoss(nn.Module):
             raise ValueError('Physical control spacings required for active control regularization')
         if penalty:
             values['control'] = torch.stack(penalty).mean()
+        if controls.get('regional_motion') is not None and stage!='shape':
+            if regional_motion_spacings_mm is None or regional_motion_spacings_mm.shape!=(4,3):
+                raise ValueError('Four physical regional motion spacings required for control regularization')
+            grid = controls['regional_motion'][:,1:]
+            region_penalty = [(grid.diff(dim=3+axis)/regional_motion_spacings_mm[:,axis][None,None,:,None,None,None,None]).square().mean()
+                              for axis in range(3)]
+            # Keep the existing global/shape regularizer's scale unchanged.
+            values['control'] = values.get('control',p.sum()*0)+torch.stack(region_penalty).mean()
         if slice_result is not None:
             values['slice'] = slice_result['total']
         if stage=='joint' and self.weights['slice'] and slice_result is None:
@@ -163,6 +171,8 @@ def reconstruction_metrics(prediction, truth, ranges, faces):
             closing_step_motion_error_mm=float(((pv[:,0]-pv[:,-1])-(gv[:,0]-gv[:,-1])).square().sum(-1).mean().sqrt()),
             predicted_closing_gap_mm=float((pv[:,0]-pv[:,-1]).norm(dim=-1).mean()),
             gt_closing_gap_mm=float((gv[:,0]-gv[:,-1]).norm(dim=-1).mean()),
+            per_frame_trajectory_rmse_mm=error.square().mean((0,2)).sqrt().cpu().tolist(),
+            per_frame_relative_motion_rmse_mm=(u-ug).square().sum(-1).mean((0,2)).sqrt().cpu().tolist(),
             degenerate_triangles=int((area_twice<1e-8).sum()),nonfinite_vertices=int((~torch.isfinite(pv).all(-1)).sum()),
             predicted_volume_curve_ml=vp[...,i].cpu().tolist(),gt_volume_curve_ml=vg[...,i].cpu().tolist())
     return result
