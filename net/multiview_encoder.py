@@ -122,7 +122,7 @@ class MultiViewTemporalEncoder(nn.Module):
         # Concatenate scales inside each view, then flatten A2C/A3C/A4C.
         return torch.cat(pooled, dim=2).flatten(1)
 
-    def forward(self, observations):
+    def forward(self, observations, *, return_reference_spatial=False):
         # Only Mask/SDF, availability and cycle phases are read. Probe pose and
         # physical grids belong to slice supervision/evaluation; GT is excluded.
         masks, sdf = observations['masks'], observations['sdf']
@@ -201,7 +201,17 @@ class MultiViewTemporalEncoder(nn.Module):
             # CNN -> reference latent path, including all four regional codes.
             # Bias-free projections keep this residual zero if frame 0 is absent.
             z_shape = z_shape + self.direct_shape_gain*self.direct_shape_projection(direct[:,0])
-        return {'z_shape': z_shape, 'z_motion': self.motion_head(motion)}
+        result = {'z_shape': z_shape, 'z_motion': self.motion_head(motion)}
+        if return_reference_spatial:
+            # Reuse the exact unpooled tokens consumed by view attention: no
+            # second CNN and no temporal aggregation. Source frame 0 only.
+            # Scale-major, then A2C/A3C/A4C, then row-major (y,x).
+            # Existing 2D position/view/scale/availability embeddings identify
+            # spatial tokens; these are NOT physical 2D-to-3D correspondences.
+            result['reference_spatial'] = dict(
+                tokens=tokens.reshape(b,t,-1,self.width)[:,0],
+                valid=keys.reshape(b,t,-1)[:,0])
+        return result
 
 
 class EncoderDiagnostics:

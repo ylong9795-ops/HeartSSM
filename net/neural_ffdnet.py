@@ -1,7 +1,8 @@
-"""Latent-driven HeartSSM-style coarse/medium/fine + incremental motion FFD.
+"""HeartSSM-style coarse/medium/fine + incremental motion FFD.
 
 Legacy net.ffdnet.FFDNet is intentionally untouched. No dense image, GT mesh,
-SSM coefficients or acquisition pose is read by the decoder.
+SSM coefficients or acquisition pose is read by the decoder. Optional reference
+spatial tokens condition the shared Medium grid without a latent bottleneck.
 """
 import hashlib
 import math
@@ -69,6 +70,47 @@ class FineMotionHead(nn.Module):
         return self.motion(F.silu(h)).permute(0,2,3,4,1)
 
 
+class ReferenceSpatialFusion(nn.Module):
+    """One spatial 3D-query/2D-token attention residual at Medium resolution.
+
+    Grid indices follow the existing FFD (x,y,z) tensor axes. Normalized
+    positions identify queries, not probe pose or physical slice mappings.
+    This is learned spatial conditioning, not geometric backprojection.
+    """
+    def __init__(self, channels, token_width, grid_shape, width=32, heads=4):
+        super().__init__()
+        axes = [torch.linspace(-1,1,n) for n in grid_shape]
+        self.register_buffer('positions', torch.stack(torch.meshgrid(*axes,indexing='ij'),-1).reshape(-1,3),
+                             persistent=False)
+        self.query = nn.Linear(channels,width)
+        self.position = nn.Linear(3,width,bias=False)
+        self.tokens = nn.Sequential(nn.LayerNorm(token_width),nn.Linear(token_width,width))
+        self.attention = nn.MultiheadAttention(width,heads,batch_first=True)
+        self.output = nn.Linear(width,channels,bias=False)
+        # First update trains this output; subsequent updates reach attention
+        # and the shared CNN. Inherited predictions are initially identical.
+        nn.init.zeros_(self.output.weight)
+
+    def forward(self, features, reference_spatial):
+        tokens,valid = reference_spatial['tokens'],reference_spatial['valid']
+        if (tokens.ndim!=3 or tokens.shape[0]!=features.shape[0]
+                or tokens.shape[-1]!=self.tokens[0].normalized_shape[0]
+                or valid.shape!=tokens.shape[:2] or valid.dtype!=torch.bool
+                or tokens.device!=features.device or tokens.dtype!=features.dtype
+                or valid.device!=features.device):
+            raise ValueError('Reference tokens [B,N,C] and boolean validity [B,N] must match Medium features')
+        present = valid.any(-1)
+        delta = torch.zeros_like(features)
+        # Avoid all-masked softmax, and make absent references exactly neutral
+        # even after training. Unobserved tokens cannot inject NaNs or biases.
+        if present.any():
+            value = self.tokens(torch.where(valid[present,:,None],tokens[present],0.))
+            query = self.query(features[present].flatten(2).transpose(1,2)) + self.position(self.positions)
+            routed = self.attention(query,value,value,key_padding_mask=~valid[present],need_weights=False)[0]
+            delta[present] = self.output(routed).transpose(1,2).reshape_as(features[present])
+        return features + delta
+
+
 class NeuralFFDNet(nn.Module):
     def __init__(self, template_vertices_mm, chamber_ranges, faces, *, template_sha256,
                  asset_sha256, norm_to_mm, encoder_config=None, decoder_config=None):
@@ -82,13 +124,15 @@ class NeuralFFDNet(nn.Module):
                         regional_shape=True, global_shape_dim=32, regional_grid_shape=(4,4,4),
                         regional_motion=False,regional_motion_grid_shape=(5,5,5),
                         regional_motion_lower_mm=None,regional_motion_upper_mm=None,
-                        regional_motion_hidden=32)
+                        regional_motion_hidden=32, spatial_fusion='none')
         unknown = set(self.decoder_config)-set(settings)
         if unknown:
             raise ValueError('Unknown decoder settings: '+str(sorted(unknown)))
         settings.update(self.decoder_config)
         self.decoder_config = settings
         self.frames, channels = settings['frames'], settings['channels']
+        if settings['spatial_fusion'] not in ('none','reference_cross_attention_v1'):
+            raise ValueError('Unknown spatial fusion mode')
         self.seed_shape = tuple(settings['seed_shape'])
         if self.frames < 2 or channels < 1 or len(self.seed_shape)!=3 or min(self.seed_shape)<4:
             raise ValueError('At least two phases and a 3D seed >=4 nodes per axis required')
@@ -177,6 +221,12 @@ class NeuralFFDNet(nn.Module):
                 nn.init.zeros_(head[-1].weight)
                 nn.init.zeros_(head[-1].bias)
 
+        # Append after all inherited modules to preserve their initialization.
+        if settings['spatial_fusion'] == 'reference_cross_attention_v1':
+            self.spatial_fusion = ReferenceSpatialFusion(channels,self.encoder.width,self.grid_shapes[1])
+        else:
+            self.spatial_fusion = None
+
     @property
     def faces(self):
         return {c:getattr(self,'faces_'+c) for c in CHAMBERS}
@@ -200,7 +250,7 @@ class NeuralFFDNet(nn.Module):
             scales = torch.as_tensor(observations['norm_to_mm'])
             if not torch.isfinite(scales).all() or not (scales==self.norm_to_mm).all():
                 raise ValueError('Observation physical normalization differs from decoder asset')
-        return self.encoder(observations)
+        return self.encoder(observations,return_reference_spatial=self.spatial_fusion is not None)
 
     def _check_latent(self, latent, dim):
         if (latent.ndim!=2 or latent.shape[1]!=dim or latent.dtype!=self.template_vertices_mm.dtype
@@ -210,7 +260,7 @@ class NeuralFFDNet(nn.Module):
     def _deform(self, vertices, controls, level):
         return vertices+bspline_ffd_physical(vertices,controls,self.control_origins_mm[level],self.control_spacings_mm[level])
 
-    def _reference(self, z_shape):
+    def _reference(self, z_shape, reference_spatial=None):
         self._check_latent(z_shape,self.shape_dim)
         global_code = z_shape[:,:self.global_shape_dim]
         h = self.seed(global_code).reshape(z_shape.shape[0],-1,*self.seed_shape)
@@ -218,6 +268,10 @@ class NeuralFFDNet(nn.Module):
         coarse = self.deform1(h).permute(0,2,3,4,1)
         v = self._deform(self.template_vertices_mm[None].expand(z_shape.shape[0],-1,-1),coarse,0)
         h = self.deconv3(F.interpolate(h,size=self.grid_shapes[1],mode='trilinear',align_corners=True),global_code)
+        if reference_spatial is not None:
+            if self.spatial_fusion is None:
+                raise ValueError('Reference spatial tokens require an enabled fusion module')
+            h = self.spatial_fusion(h,reference_spatial)
         medium = self.deform2(h).permute(0,2,3,4,1)
         v = self._deform(v,medium,1)
         h = self.deconv2(F.interpolate(h,size=self.grid_shapes[2],mode='trilinear',align_corners=True),global_code)
@@ -245,8 +299,9 @@ class NeuralFFDNet(nn.Module):
             parts.append(v+bspline_ffd_physical(v,controls[:,i],self.regional_origin_mm,self.regional_spacing_mm))
         return torch.cat(parts,1)
 
-    def decode_shape(self, z_shape):
-        return self._reference(z_shape)[0]
+    def decode_shape(self, z_shape, reference_spatial=None):
+        """Omitting reference_spatial explicitly evaluates the latent-only path."""
+        return self._reference(z_shape,reference_spatial)[0]
 
     def apply_motion_regions(self,vertices,controls):
         """Smooth mm increments with fixed chamber supports and fixed domains."""
@@ -260,11 +315,11 @@ class NeuralFFDNet(nn.Module):
             displacement_rms.append(delta.square().sum(-1).mean(-1).sqrt())
         return torch.cat(parts,1),torch.stack(displacement_rms,-1)
 
-    def decode_4d(self, z_shape, z_motion, *, return_details=False):
+    def decode_4d(self, z_shape, z_motion, *, reference_spatial=None, return_details=False):
         self._check_latent(z_motion,self.motion_dim)
         if z_shape.shape[0]!=z_motion.shape[0]:
             raise ValueError('Shape and motion batches differ')
-        reference,h,coarse,medium,fine,regions = self._reference(z_shape)
+        reference,h,coarse,medium,fine,regions = self._reference(z_shape,reference_spatial)
         trajectory,fields = [reference],[fine]
         regional_fields,regional_rms = [],[]
         if self.regional_motion:

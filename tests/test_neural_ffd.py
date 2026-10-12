@@ -24,7 +24,7 @@ class NeuralTestCase(unittest.TestCase):
         torch.set_num_threads(1)
 
 
-def small_model(frames=4,regional_motion=False):
+def small_model(frames=4,regional_motion=False,spatial_fusion='none'):
     import trimesh
     mesh = trimesh.creation.icosphere(subdivisions=1,radius=2.)
     vertices = torch.cat([torch.tensor(mesh.vertices,dtype=torch.float32)+torch.tensor(center)
@@ -41,7 +41,132 @@ def small_model(frames=4,regional_motion=False):
         encoder_config=dict(shape_dim=12,motion_dim=4,width=16,heads=2,temporal_layers=1,
                             spatial_sides=(4,2),query_slots=2,cnn_chunk_size=4),
         decoder_config=dict(frames=frames,channels=4,seed_shape=(4,4,4),global_shape_dim=4,
-                            lower_mm=(-10.,-10.,-10.),upper_mm=(10.,10.,10.),**regional))
+                            lower_mm=(-10.,-10.,-10.),upper_mm=(10.,10.,10.),
+                            spatial_fusion=spatial_fusion,**regional))
+
+
+class SpatialFusionTests(NeuralTestCase):
+    def setUp(self):
+        torch.set_num_threads(2)
+        torch.manual_seed(104)
+
+    def test_encoder_reuses_cnn_and_only_reference_tokens(self):
+        net = small_model(spatial_fusion='reference_cross_attention_v1').eval()
+        x = observations(2,4,32)
+        seen = []
+        handle = net.encoder.stem.register_forward_pre_hook(lambda m,a:seen.append(a[0].shape[0]))
+        with torch.no_grad():
+            encoded = net.encode(x)
+        handle.remove()
+        self.assertEqual(sum(seen),2*4*3)
+        self.assertEqual(len(seen),6)  # chunk size 4, no extra reference pass
+        spatial = encoded['reference_spatial']
+        self.assertEqual(spatial['tokens'].shape,(2,3*(4**2+2**2),16))
+        self.assertEqual(spatial['valid'].shape,(2,60))
+        changed = dict(x,sdf=x['sdf'].clone())
+        changed['sdf'][:,1:] += 4
+        with torch.no_grad():
+            later = net.encode(changed)
+            legacy = net.encoder(x)
+        self.assertTrue(torch.equal(spatial['tokens'],later['reference_spatial']['tokens']))
+        for key in ('z_shape','z_motion'):
+            self.assertTrue(torch.equal(encoded[key],legacy[key]))
+
+    def test_zero_initialization_checkpoint_and_motion_semantics(self):
+        from train_neural_ffd import save_checkpoint,load_checkpoint
+        from unittest.mock import patch
+        old = small_model(frames=24).eval()
+        torch.manual_seed(104)
+        new = small_model(frames=24,spatial_fusion='reference_cross_attention_v1').eval()
+        for key,value in old.state_dict().items():
+            self.assertTrue(torch.equal(value,new.state_dict()[key]),key)
+        x = observations(1,24,32)
+        with torch.no_grad():
+            a,b = old(x),new(x)
+        for key in ('vertices_ref','vertices_4d','z_shape','z_motion'):
+            self.assertTrue(torch.equal(a[key],b[key]),key)
+        for key in ('coarse','medium','fine_motion','regions'):
+            self.assertTrue(torch.equal(a['control_grids'][key],b['control_grids'][key]),key)
+        self.assertEqual(old.geometry_sha256,new.geometry_sha256)
+        self.assertEqual(old.grid_shapes,new.grid_shapes)
+        # Verify the original recurrence, phase index and per-phase field on
+        # nonzero fused features too, without introducing a new Motion head.
+        torch.nn.init.normal_(new.spatial_fusion.output.weight,std=.02)
+        with torch.no_grad(), patch.object(new.deform3,'motion_field',wraps=new.deform3.motion_field) as calls:
+            out = new(x)
+            self.assertEqual([call.args[-1] for call in calls.call_args_list],list(range(23)))
+            for phase,call in enumerate(calls.call_args_list):
+                field = calls._mock_wraps(*call.args)
+                torch.testing.assert_close(field,out['control_grids']['fine_motion'][:,phase+1])
+                torch.testing.assert_close(new._deform(out['vertices_4d'][:,phase],field,2),
+                                           out['vertices_4d'][:,phase+1])
+            changed_motion = new.decode_4d(out['z_shape'],out['z_motion']+2,
+                reference_spatial=out['reference_spatial'],return_details=True)
+            self.assertTrue(torch.equal(out['vertices_ref'],changed_motion['vertices_ref']))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'fusion.pth'
+            save_checkpoint(path,new,None,config={},identity={})
+            restored,_ = load_checkpoint(path)
+            with torch.no_grad():
+                torch.testing.assert_close(restored.eval()(x)['vertices_4d'],out['vertices_4d'],rtol=0,atol=0)
+
+    def test_training_escape_gradients_and_local_fine_response(self):
+        net = small_model(spatial_fusion='reference_cross_attention_v1').eval()
+        x = observations(1,4,32)
+        latent = net.encode(x)
+        shape = latent['z_shape'].detach()
+        spatial = {k:v.detach() for k,v in latent['reference_spatial'].items()}
+        target = net.template_vertices_mm[None]+torch.tensor([.7,-.2,.4])
+        optimizer = torch.optim.Adam(net.spatial_fusion.parameters(),lr=.01)
+        loss = (net.decode_shape(shape,spatial)-target).square().mean()
+        loss.backward()
+        self.assertGreater(float(net.spatial_fusion.output.weight.grad.norm()),0.)
+        optimizer.step()
+        self.assertGreater(float(net.spatial_fusion.output.weight.norm()),0.)
+        # Detaching every latent isolates the new route to the original CNN.
+        latent = net.encode(x)
+        reference = net._reference(shape,latent['reference_spatial'])
+        for value in (reference[0],reference[4]):
+            gradients = torch.autograd.grad(value.square().mean(),
+                (latent['reference_spatial']['tokens'],net.encoder.stem[0].weight),retain_graph=True)
+            for grad in gradients:
+                self.assertTrue(torch.isfinite(grad).all())
+                self.assertGreater(float(grad.norm()),0.)
+            self.assertGreater(float(gradients[0][:,:48].norm()),0.)
+            self.assertGreater(float(gradients[0][:,48:].norm()),0.)
+        # Two opposite local token perturbations preserve global token mean.
+        # Compare actual Fine controls, not just an attention/gradient norm.
+        changed = dict(spatial,tokens=spatial['tokens'].clone())
+        perturb = torch.linspace(-3.,3.,16)
+        changed['tokens'][:,0] += perturb
+        changed['tokens'][:,5] -= perturb
+        torch.testing.assert_close(changed['tokens'].mean(1),spatial['tokens'].mean(1))
+        with torch.no_grad():
+            base = net._reference(shape,spatial)
+            moved = net._reference(shape,changed)
+        delta = moved[4]-base[4]
+        self.assertTrue(torch.isfinite(delta).all())
+        self.assertGreater(float(delta.norm()),1e-7)
+        self.assertGreater(float(delta.flatten(1,3).std(1).norm()),1e-8)
+        self.assertGreater(float((moved[0]-base[0]).norm()),1e-7)
+        self.assertTrue(torch.equal(base[2],moved[2]))  # Coarse remains latent-only
+        # Query position must matter, even with spatially constant 3D content.
+        medium = torch.ones(1,4,8,8,8)
+        d = net.spatial_fusion(medium,changed)-net.spatial_fusion(medium,spatial)
+        self.assertGreater(float(d.flatten(2).std(-1).norm()),1e-8)
+
+    def test_missing_reference_and_masked_tokens_remain_neutral(self):
+        net = small_model(spatial_fusion='reference_cross_attention_v1').eval()
+        torch.nn.init.normal_(net.spatial_fusion.output.weight,std=.1)
+        spatial = dict(tokens=torch.randn(2,60,16),valid=torch.ones(2,60,dtype=torch.bool))
+        spatial['valid'][0] = False
+        spatial['valid'][1,3:10] = False
+        medium = torch.randn(2,4,8,8,8)
+        a = net.spatial_fusion(medium,spatial)
+        spatial['tokens'][~spatial['valid']] = float('nan')
+        b = net.spatial_fusion(medium,spatial)
+        self.assertTrue(torch.equal(a,b))
+        self.assertTrue(torch.equal(a[0],medium[0]))
 
 
 class DecoderTests(NeuralTestCase):
