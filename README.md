@@ -1,6 +1,16 @@
 # HeartSSM
 Learning a dynamic four-chamber shape model of the human heart for 95,695 UK Biobank participants
 
+Geometry-aware Joint HeartFFDNet is implemented independently in
+[`net/geometry_heartffdnet.py`](net/geometry_heartffdnet.py), reusing the existing
+FFDNet spatial layers and three deformation heads. Known-pose physical lifting
+feeds all 24 phases into one shared 3D U-Net; one 72-channel head predicts the
+complete cycle before sequential physical FFD application. See the
+[implementation and acceptance report](GEOMETRY_HEARTFFD.rst) and
+[`configs/geometry_heartffd_1k.yaml`](configs/geometry_heartffd_1k.yaml).
+`train_geometry_heartffdnet.py` requires an explicit `--acceptance`, `--evaluate`
+or `--train` action; architecture acceptance does not launch full 1K training.
+
 Neural HeartFFDNet adds three-view 2D mask/SDF sequences, shape/motion latents,
 learned 3D features, physical multiscale FFD and four-chamber 4D supervision.
 The original volume-based pipeline remains available unchanged.
