@@ -50,9 +50,11 @@ def load_config(path):
     training = config['training']
     unknown = set(training)-{'device','seed','epochs','shape_epochs','motion_epochs','batch_size',
         'learning_rate','workers','cpu_threads','validation_cases','checkpoint_every_steps',
-        'output','joint_min_learning_rate','save_best'}
+        'output','joint_min_learning_rate','save_best','freeze'}
     if unknown:
         raise ValueError('Unknown training settings: '+str(sorted(unknown)))
+    if training.get('freeze','none') not in ('none','dynamic_only','motion_head_only'):
+        raise ValueError('Unknown explicit training freeze scope')
     data_config = yaml.safe_load(repository_path(config['data_config']).read_text())
     data = data_config['data']
     if (tuple(data['views'])!=VIEWS or tuple(data['chambers'])!=CHAMBERS
@@ -189,6 +191,11 @@ def initialize_from_checkpoint(model,path,identity):
             for key in tuple(settings):
                 if key.startswith('regional_motion'):
                     settings.pop(key)
+    if model.dynamic_conditioner is not None and source.dynamic_conditioner is None:
+        for settings in (old_decoder,new_decoder):
+            for key in tuple(settings):
+                if key=='dynamic_spatial' or key.startswith('dynamic_spatial_'):
+                    settings.pop(key)
     if old_encoder != new_encoder or old_decoder != new_decoder:
         raise ValueError('Initialization changes existing encoder/decoder configuration')
     current,previous = model.state_dict(),source.state_dict()
@@ -196,6 +203,8 @@ def initialize_from_checkpoint(model,path,identity):
     if model.regional_motion and not source.regional_motion:
         allowed.update(key for key in current if key.startswith('regional_motion_heads.') or key in
             ('regional_motion_lower_mm','regional_motion_upper_mm','regional_motion_origins_mm','regional_motion_spacings_mm'))
+    if model.dynamic_conditioner is not None and source.dynamic_conditioner is None:
+        allowed.update(key for key in current if key.startswith('dynamic_conditioner.'))
     if set(current)-set(previous) != allowed or set(previous)-set(current):
         raise ValueError('Initialization weight changes differ from explicit new-module allowlist')
     for key,value in previous.items():
@@ -243,8 +252,19 @@ def learning_rate_for_epoch(epoch,config,stage):
     return minimum+(base-minimum)*(1+math.cos(math.pi*fraction))/2
 
 
+def configure_trainable(model,training):
+    """Explicit Goal03 activation scope, also applied before strict resume."""
+    scope=training.get('freeze','none')
+    for name,parameter in model.named_parameters():
+        parameter.requires_grad_(scope=='none' or
+            (scope=='dynamic_only' and name.startswith('dynamic_conditioner.')) or
+            (scope=='motion_head_only' and name.startswith('deform3.') and not name.startswith('deform3.reference.')))
+    if not any(p.requires_grad for p in model.parameters()):
+        raise ValueError('Freeze scope leaves no trainable parameters')
+
+
 def make_optimizer(model,training):
-    return torch.optim.Adam(model.parameters(),lr=training['learning_rate'])
+    return torch.optim.Adam((p for p in model.parameters() if p.requires_grad),lr=training['learning_rate'])
 
 
 def best_checkpoint_candidates(summary):
@@ -619,6 +639,7 @@ def main():
             initialization = initialize_from_checkpoint(model,args.initialize,identity)
             (output_dir/'initialization.json').write_text(json.dumps(initialization,indent=2)+'\n')
     (output_dir/'config.yaml').write_text(yaml.safe_dump(config,sort_keys=False))
+    configure_trainable(model,training)
     optimizer = make_optimizer(model,training)
     if args.resume:
         optimizer.load_state_dict(saved['optimizer'])
@@ -644,6 +665,10 @@ def main():
             loader = training_loader(train,order[offset:],batch_size=training['batch_size'],
                 workers=reader_workers,prefetch=args.train_prefetch,device=device,generator=generator,stage=stage)
             model.train()
+            if training.get('freeze','none')!='none':
+                # Frozen GroupNorm CNN/Transformer use their inherited eval
+                # numerical path; the new dynamic module stays in train mode.
+                model.encoder.eval()
             loss_sum,loss_samples = recover_epoch_loss(output_dir/'history.jsonl',epoch,offset)
             stopping = False
             io_seconds,compute_seconds,processed_samples = 0.,0.,0
@@ -663,6 +688,27 @@ def main():
                     finite_gradients = [torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None]
                     if finite_gradients and not torch.stack(finite_gradients).all():
                         raise ValueError('Nonfinite network gradient')
+                    dynamic_probe=None
+                    if model.dynamic_conditioner is not None and (step==0 or (step+1)%200==0):
+                        # Same already encoded tensors and same pre-update
+                        # weights. No second CNN and no optimizer action in the
+                        # paired diagnostic. Recursive downstream effects remain.
+                        with torch.no_grad():
+                            off=model.decode_4d(decoded['z_shape'].detach(),decoded['z_motion'].detach(),return_details=True)
+                            field_delta=decoded['control_grids']['fine_motion'][:,1:].detach()-off['control_grids']['fine_motion'][:,1:]
+                            mesh_delta=decoded['vertices_4d'].detach()-off['vertices_4d']
+                            center=field_delta-field_delta.mean((2,3,4),keepdim=True)
+                            prediction=decoded['vertices_4d'].detach()
+                            truth=batch['vertices_gt'].to(prediction)
+                            motion_error=(prediction-prediction[:,:1])-(truth-truth[:,:1])
+                            dynamic_probe=dict(measured_before_update=step+1,
+                                fine_control_vector_rms_mm=float(field_delta.square().sum(-1).mean().sqrt()),
+                                fine_control_centered_energy_fraction=float(center.square().sum()/(field_delta.square().sum()+1e-20)),
+                                mesh_4d_vector_rms_mm=float(mesh_delta.square().sum(-1).mean().sqrt()),
+                                reference_max_abs_mm=float(mesh_delta[:,0].abs().max()),
+                                chamber_mesh_delta_rms_mm={c:float(mesh_delta[:,:,a:b].square().sum(-1).mean().sqrt()) for c,(a,b) in zip(CHAMBERS,model.chamber_ranges.tolist())},
+                                chamber_motion_rmse_mm={c:float(motion_error[:,:,a:b].square().sum(-1).mean().sqrt()) for c,(a,b) in zip(CHAMBERS,model.chamber_ranges.tolist())})
+                            del off,field_delta,mesh_delta,center,motion_error
                     optimizer.step()
                     batch_cases = batch['masks'].shape[0]
                     offset += batch_cases
@@ -675,6 +721,19 @@ def main():
                         terms=dict(zip(term_keys,loss_scalars[1:])),
                         active_weights=losses['active_weights'],units=losses['units'],seconds=time.perf_counter()-start)
                     record['io_wait_seconds'] = io_wait
+                    if torch.device(device).type=='cuda':
+                        record['gpu_peak_allocated_bytes'] = torch.cuda.max_memory_allocated(device)
+                        record['gpu_peak_reserved_bytes'] = torch.cuda.max_memory_reserved(device)
+                    if model.dynamic_conditioner is not None:
+                        record['dynamic_spatial'] = dict(
+                            phase_statistics=decoded['dynamic_statistics'].detach().mean(0).cpu().tolist(),
+                            columns=['query_change_rms','centered_medium_rms','fine_feature_rms','medium_centered_energy_fraction'],
+                            output_weight_l2=float(model.dynamic_conditioner.output.weight.detach().norm()),
+                            output_gradient_l2=float(model.dynamic_conditioner.output.weight.grad.norm()),
+                            attention_gradient_l2=float(sum((p.grad.detach().square().sum() for p in
+                                model.dynamic_conditioner.attention.parameters() if p.grad is not None),
+                                model.dynamic_conditioner.output.weight.new_zeros(())).sqrt()))
+                        if dynamic_probe is not None:record['dynamic_spatial']['paired_branch_probe']=dynamic_probe
                     if model.regional_motion:
                         grids = decoded['control_grids']['regional_motion'].detach()
                         record['regional_motion'] = dict(

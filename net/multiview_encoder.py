@@ -122,7 +122,7 @@ class MultiViewTemporalEncoder(nn.Module):
         # Concatenate scales inside each view, then flatten A2C/A3C/A4C.
         return torch.cat(pooled, dim=2).flatten(1)
 
-    def forward(self, observations, *, return_reference_spatial=False):
+    def forward(self, observations, *, return_reference_spatial=False, return_dynamic_spatial=False):
         # Only Mask/SDF, availability and cycle phases are read. Probe pose and
         # physical grids belong to slice supervision/evaluation; GT is excluded.
         masks, sdf = observations['masks'], observations['sdf']
@@ -211,6 +211,12 @@ class MultiViewTemporalEncoder(nn.Module):
             result['reference_spatial'] = dict(
                 tokens=tokens.reshape(b,t,-1,self.width)[:,0],
                 valid=keys.reshape(b,t,-1)[:,0])
+        if return_dynamic_spatial:
+            # The same once-computed CNN tokens, before temporal readout. Keep
+            # channel availability so adjacent observations with different
+            # annotation semantics cannot be mistaken for patient motion.
+            result['dynamic_spatial'] = dict(tokens=tokens.reshape(b,t,-1,self.width),
+                valid=keys.reshape(b,t,-1), channel_valid=valid)
         return result
 
 

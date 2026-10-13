@@ -10,9 +10,11 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from data.mask_transform import CHAMBERS
 from net.multiview_encoder import MultiViewTemporalEncoder
+from net.module import ConvBlock
 from utils.ffd_physical import bspline_ffd_physical, control_geometry
 
 ARCHITECTURE = 'neural-heartffd-incremental-v1'
@@ -111,6 +113,142 @@ class ReferenceSpatialFusion(nn.Module):
         return features + delta
 
 
+class DynamicSpatialConditioner(nn.Module):
+    """Shared adjacent-frame reads in a learned 3D query space.
+
+    A broad, learnable view-specific coordinate bias distinguishes queries.
+    Coordinates are normalized lattice/image indices, NOT source probe pose
+    or a physical backprojection. Attention locality is an inductive bias,
+    never evidence of anatomical correspondence by itself.
+    """
+    def __init__(self, channels, token_width, grid_shape, spatial_sides,
+                 width=16, heads=4, frame_chunk=2, query_chunk=128, sigma=.6):
+        super().__init__()
+        if (min(width,heads,frame_chunk,query_chunk)<1 or width%heads
+                or not math.isfinite(sigma) or not .2<=sigma<=1.5):
+            raise ValueError('Compatible dynamic attention sizes and broad finite spatial sigma required')
+        self.grid_shape=tuple(grid_shape)
+        self.width,self.heads=width,heads
+        self.frame_chunk,self.query_chunk=frame_chunk,query_chunk
+        axes=[torch.linspace(-1,1,n) for n in grid_shape]
+        self.register_buffer('positions',torch.stack(torch.meshgrid(*axes,indexing='ij'),-1).reshape(-1,3),persistent=False)
+        token_positions,token_views=[],[]
+        for side in spatial_sides:
+            y,x=torch.meshgrid(torch.linspace(-1,1,side),torch.linspace(-1,1,side),indexing='ij')
+            token_positions.append(torch.stack((x,y),-1).reshape(-1,2).repeat(3,1))
+            token_views.append(torch.arange(3).repeat_interleave(side*side))
+        self.register_buffer('token_positions',torch.cat(token_positions),persistent=False)
+        self.register_buffer('token_views',torch.cat(token_views),persistent=False)
+        self.query=nn.Linear(channels,width)
+        self.position=nn.Linear(3,width,bias=False)
+        self.tokens=nn.Sequential(nn.LayerNorm(token_width),nn.Linear(token_width,width))
+        self.attention=nn.MultiheadAttention(width,heads,batch_first=True)
+        maps=torch.zeros(3,2,3)
+        for view in range(3):
+            angle=view*math.pi/3
+            maps[view,0,0],maps[view,0,1]=math.cos(angle),math.sin(angle)
+            maps[view,1,2]=1.
+        self.query_to_uv=nn.Parameter(maps)
+        self.query_uv_offset=nn.Parameter(torch.zeros(3,2))
+        self.log_sigma=nn.Parameter(torch.full((3,),math.log(sigma)))
+        self.local=ConvBlock(width,width,K=3)
+        self.output=nn.Conv3d(width,channels,1,bias=False)
+        nn.init.zeros_(self.output.weight)
+
+    def spatial_bias(self):
+        anchors=torch.tanh(torch.einsum('qd,vud->qvu',self.positions,self.query_to_uv)+self.query_uv_offset)
+        delta=anchors[:,self.token_views]-self.token_positions[None]
+        sigma=self.log_sigma.exp().clamp(.2,1.5)[self.token_views]
+        return -delta.square().sum(-1)/(2*sigma.square()[None])
+
+    def _attend(self,q,tokens,mask):
+        return self.attention(q,tokens,tokens,attn_mask=mask,need_weights=False)[0]
+
+    def _read(self,query,values,view_valid,bias):
+        # [B,F,N,W]; F<=frame_chunk. Same queries and parameters for every frame.
+        b,frames,n,_=values.shape
+        key_valid=view_valid[:,None,:,].expand(-1,frames,-1)[...,self.token_views].reshape(b*frames,n)
+        present=key_valid.any(-1)
+        output=query.new_zeros(b*frames,query.shape[1],self.width)
+        if present.any():
+            q=query[:,None].expand(-1,frames,-1,-1).reshape(b*frames,-1,self.width)[present]
+            value=values.reshape(b*frames,n,self.width)[present]
+            valid=key_valid[present]
+            pieces=[]
+            for start in range(0,q.shape[1],self.query_chunk):
+                part=q[:,start:start+self.query_chunk]
+                mask=bias[None,start:start+self.query_chunk].expand(len(part),-1,-1)
+                mask=mask.masked_fill(~valid[:,None],-torch.inf)
+                mask=mask[:,None].expand(-1,self.heads,-1,-1).reshape(-1,part.shape[1],n)
+                routed=(checkpoint(self._attend,part,value,mask,use_reentrant=False)
+                    if self.training and torch.is_grad_enabled() else self._attend(part,value,mask))
+                pieces.append(routed)
+            output[present]=torch.cat(pieces,1)
+        return output.reshape(b,frames,-1,self.width)
+
+    def query_changes(self,features,dynamic_spatial):
+        tokens,valid,channels=(dynamic_spatial[k] for k in ('tokens','valid','channel_valid'))
+        b=features.shape[0]
+        if (tokens.ndim!=4 or tokens.shape[0]!=b or tokens.shape[2]!=len(self.token_views)
+                or tokens.shape[3]!=self.tokens[0].normalized_shape[0]
+                or valid.shape!=tokens.shape[:3] or valid.dtype!=torch.bool
+                or channels.shape!=(b,tokens.shape[1],3,4) or channels.dtype!=torch.bool
+                or any(v.device!=features.device for v in (tokens,valid,channels))
+                or tokens.dtype!=features.dtype):
+            raise ValueError('Dynamic tokens [B,T,N,W], token validity and per-frame channel validity required')
+        if not torch.equal(valid,channels.any(-1)[...,self.token_views]):
+            raise ValueError('Dynamic token and channel observation validity differ')
+        if not torch.isfinite(tokens[valid]).all():
+            raise ValueError('Finite valid dynamic tokens required')
+        # CNN maps mix channels. When annotation semantics change, discard the
+        # entire view for this pair rather than pretending its missing channel
+        # is empty or re-running the CNN with a different input.
+        pairs=(channels[:,1:]==channels[:,:-1]).all(-1)&channels[:,1:].any(-1)&channels[:,:-1].any(-1)
+        values=self.tokens(torch.where(valid[...,None],tokens,0.))
+        medium=F.adaptive_avg_pool3d(features,self.grid_shape)
+        query=self.query(medium.flatten(2).transpose(1,2))+self.position(self.positions)[None]
+        bias=self.spatial_bias()
+        if (pairs==pairs[:,:1]).all():
+            # Normal full-cycle data: read each of the 24 frames exactly once.
+            reads=torch.cat([self._read(query,values[:,start:start+self.frame_chunk],pairs[:,0],bias)
+                for start in range(0,tokens.shape[1],self.frame_chunk)],1)
+            difference=reads[:,1:]-reads[:,:-1]
+        else:
+            # Reuse any identical (frame, common-view-mask) query result.
+            cache={}
+            changes=[]
+            for phase in range(tokens.shape[1]-1):
+                mask=pairs[:,phase]
+                signature=tuple(mask.reshape(-1).tolist())
+                adjacent=[]
+                for frame in (phase,phase+1):
+                    key=(frame,signature)
+                    if key not in cache:
+                        cache[key]=self._read(query,values[:,frame:frame+1],mask,bias)[:,0]
+                    adjacent.append(cache[key])
+                changes.append(adjacent[1]-adjacent[0])
+            difference=torch.stack(changes,1)
+        return difference.permute(0,1,3,2).reshape(b,tokens.shape[1]-1,self.width,*self.grid_shape)
+
+    def increment(self,features,change):
+        # Preserve temporal-change magnitude across the local InstanceNorm.
+        # A truly unchanged query read remains exactly neutral, even if the
+        # convolution develops a bias. Norm has a defined zero gradient at 0.
+        scale=torch.linalg.vector_norm(change.flatten(1),dim=-1)/math.sqrt(change[0].numel())
+        raw=self.output(self.local(change))*scale[:,None,None,None,None]
+        mean=raw.flatten(2).mean(-1)[...,None,None,None]
+        medium=raw-mean
+        fine=F.interpolate(medium,size=features.shape[-3:],mode='trilinear',align_corners=True)
+        fine=fine-fine.flatten(2).mean(-1)[...,None,None,None]
+        # Centering excludes broadcast modes by construction; it is not proof
+        # of learned anatomical selectivity. Fine/mesh response is tested too.
+        total=raw.square().flatten(1).mean(-1)
+        centered=medium.square().flatten(1).mean(-1)
+        stats=torch.stack((scale,centered.sqrt(),fine.square().flatten(1).mean(-1).sqrt(),
+            centered/(total+1e-20)),dim=-1).detach()
+        return features+fine,stats
+
+
 class NeuralFFDNet(nn.Module):
     def __init__(self, template_vertices_mm, chamber_ranges, faces, *, template_sha256,
                  asset_sha256, norm_to_mm, encoder_config=None, decoder_config=None):
@@ -124,7 +262,9 @@ class NeuralFFDNet(nn.Module):
                         regional_shape=True, global_shape_dim=32, regional_grid_shape=(4,4,4),
                         regional_motion=False,regional_motion_grid_shape=(5,5,5),
                         regional_motion_lower_mm=None,regional_motion_upper_mm=None,
-                        regional_motion_hidden=32, spatial_fusion='none')
+                        regional_motion_hidden=32, spatial_fusion='none',dynamic_spatial='none',
+                        dynamic_spatial_width=16,dynamic_spatial_heads=4,dynamic_spatial_frame_chunk=2,
+                        dynamic_spatial_query_chunk=128,dynamic_spatial_sigma=.6)
         unknown = set(self.decoder_config)-set(settings)
         if unknown:
             raise ValueError('Unknown decoder settings: '+str(sorted(unknown)))
@@ -133,6 +273,10 @@ class NeuralFFDNet(nn.Module):
         self.frames, channels = settings['frames'], settings['channels']
         if settings['spatial_fusion'] not in ('none','reference_cross_attention_v1'):
             raise ValueError('Unknown spatial fusion mode')
+        if settings['dynamic_spatial'] not in ('none','query_difference_v1'):
+            raise ValueError('Unknown dynamic spatial conditioning mode')
+        if settings['dynamic_spatial']!='none' and (settings['spatial_fusion']!='none' or settings['regional_motion']):
+            raise ValueError('Dynamic experiment requires the original reference and shared Motion head')
         self.seed_shape = tuple(settings['seed_shape'])
         if self.frames < 2 or channels < 1 or len(self.seed_shape)!=3 or min(self.seed_shape)<4:
             raise ValueError('At least two phases and a 3D seed >=4 nodes per axis required')
@@ -226,6 +370,10 @@ class NeuralFFDNet(nn.Module):
             self.spatial_fusion = ReferenceSpatialFusion(channels,self.encoder.width,self.grid_shapes[1])
         else:
             self.spatial_fusion = None
+        self.dynamic_conditioner=(DynamicSpatialConditioner(channels,self.encoder.width,self.grid_shapes[1],
+            self.encoder.spatial_sides,width=settings['dynamic_spatial_width'],heads=settings['dynamic_spatial_heads'],
+            frame_chunk=settings['dynamic_spatial_frame_chunk'],query_chunk=settings['dynamic_spatial_query_chunk'],
+            sigma=settings['dynamic_spatial_sigma']) if settings['dynamic_spatial']!='none' else None)
 
     @property
     def faces(self):
@@ -250,7 +398,8 @@ class NeuralFFDNet(nn.Module):
             scales = torch.as_tensor(observations['norm_to_mm'])
             if not torch.isfinite(scales).all() or not (scales==self.norm_to_mm).all():
                 raise ValueError('Observation physical normalization differs from decoder asset')
-        return self.encoder(observations,return_reference_spatial=self.spatial_fusion is not None)
+        return self.encoder(observations,return_reference_spatial=self.spatial_fusion is not None,
+            return_dynamic_spatial=self.dynamic_conditioner is not None)
 
     def _check_latent(self, latent, dim):
         if (latent.ndim!=2 or latent.shape[1]!=dim or latent.dtype!=self.template_vertices_mm.dtype
@@ -315,11 +464,17 @@ class NeuralFFDNet(nn.Module):
             displacement_rms.append(delta.square().sum(-1).mean(-1).sqrt())
         return torch.cat(parts,1),torch.stack(displacement_rms,-1)
 
-    def decode_4d(self, z_shape, z_motion, *, reference_spatial=None, return_details=False):
+    def decode_4d(self, z_shape, z_motion, *, reference_spatial=None, dynamic_spatial=None, return_details=False):
         self._check_latent(z_motion,self.motion_dim)
         if z_shape.shape[0]!=z_motion.shape[0]:
             raise ValueError('Shape and motion batches differ')
         reference,h,coarse,medium,fine,regions = self._reference(z_shape,reference_spatial)
+        changes=None
+        dynamic_stats=[]
+        if dynamic_spatial is not None:
+            if self.dynamic_conditioner is None or dynamic_spatial['tokens'].shape[1]!=self.frames:
+                raise ValueError('Enabled dynamic module and matching complete cycle required')
+            changes=self.dynamic_conditioner.query_changes(h,dynamic_spatial)
         trajectory,fields = [reference],[fine]
         regional_fields,regional_rms = [],[]
         if self.regional_motion:
@@ -327,7 +482,11 @@ class NeuralFFDNet(nn.Module):
             regional_fields.append(reference.new_zeros(z_shape.shape[0],4,*self.regional_motion_grid_shape,3))
             regional_rms.append(reference.new_zeros(z_shape.shape[0],4))
         for phase in range(self.frames-1):
-            field = self.deform3.motion_field(h,z_shape,z_motion,phase)
+            features=h
+            if changes is not None:
+                features,stats=self.dynamic_conditioner.increment(h,changes[:,phase])
+                dynamic_stats.append(stats)
+            field = self.deform3.motion_field(features,z_shape,z_motion,phase)
             updated = self._deform(trajectory[-1],field,2)
             if self.regional_motion:
                 time = self.deform3.phase_embedding.weight[phase][None].expand(z_shape.shape[0],-1)
@@ -344,6 +503,7 @@ class NeuralFFDNet(nn.Module):
         if not return_details:
             return vertices
         return dict(vertices_ref=reference,vertices_4d=vertices,
+                    dynamic_statistics=torch.stack(dynamic_stats,1) if dynamic_stats else None,
                     regional_motion_rms_mm=torch.stack(regional_rms,1) if self.regional_motion else None,
                     control_grids=dict(coarse=coarse,medium=medium,fine_motion=torch.stack(fields,1),regions=regions,
                         regional_motion=torch.stack(regional_fields,1) if self.regional_motion else None))

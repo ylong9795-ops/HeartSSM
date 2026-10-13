@@ -24,7 +24,7 @@ class NeuralTestCase(unittest.TestCase):
         torch.set_num_threads(1)
 
 
-def small_model(frames=4,regional_motion=False,spatial_fusion='none'):
+def small_model(frames=4,regional_motion=False,spatial_fusion='none',dynamic_spatial='none'):
     import trimesh
     mesh = trimesh.creation.icosphere(subdivisions=1,radius=2.)
     vertices = torch.cat([torch.tensor(mesh.vertices,dtype=torch.float32)+torch.tensor(center)
@@ -42,7 +42,161 @@ def small_model(frames=4,regional_motion=False,spatial_fusion='none'):
                             spatial_sides=(4,2),query_slots=2,cnn_chunk_size=4),
         decoder_config=dict(frames=frames,channels=4,seed_shape=(4,4,4),global_shape_dim=4,
                             lower_mm=(-10.,-10.,-10.),upper_mm=(10.,10.,10.),
-                            spatial_fusion=spatial_fusion,**regional))
+                            spatial_fusion=spatial_fusion,dynamic_spatial=dynamic_spatial,
+                            dynamic_spatial_width=8,dynamic_spatial_heads=2,dynamic_spatial_query_chunk=64,**regional))
+
+
+class DynamicSpatialTests(NeuralTestCase):
+    def setUp(self):
+        torch.set_num_threads(2)
+        torch.manual_seed(603)
+
+    def test_once_computed_cycle_tokens_and_gt_pose_independence(self):
+        net=small_model(frames=24,dynamic_spatial='query_difference_v1').eval()
+        x=observations(2,24,32)
+        counts=[]
+        handle=net.encoder.stem.register_forward_pre_hook(lambda m,a:counts.append(len(a[0])))
+        with torch.no_grad():encoded=net.encode(x)
+        handle.remove()
+        self.assertEqual(sum(counts),2*24*3)
+        self.assertEqual(encoded['dynamic_spatial']['tokens'].shape,(2,24,60,16))
+        self.assertEqual(encoded['dynamic_spatial']['valid'].shape,(2,24,60))
+        self.assertEqual(encoded['dynamic_spatial']['channel_valid'].shape,(2,24,3,4))
+        poisoned=dict(x,pose_gt='must not be read',vertices_gt=torch.full((1,),float('nan')))
+        with torch.no_grad():other=net.encode(poisoned)
+        for key in ('z_shape','z_motion'):self.assertTrue(torch.equal(encoded[key],other[key]))
+        self.assertTrue(torch.equal(encoded['dynamic_spatial']['tokens'],other['dynamic_spatial']['tokens']))
+
+    def test_strict_inheritance_zero_equivalence_and_freeze_scopes(self):
+        from train_neural_ffd import save_checkpoint,load_checkpoint,initialize_from_checkpoint,configure_trainable
+        old=small_model().eval();new=small_model(dynamic_spatial='query_difference_v1').eval()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'source.pth'
+            save_checkpoint(path,old,None,config={},identity={'val':'fixed'})
+            metadata=initialize_from_checkpoint(new,path,{'val':'fixed'})
+            self.assertTrue(metadata['new_keys'])
+            self.assertTrue(all(k.startswith('dynamic_conditioner.') for k in metadata['new_keys']))
+            for key,value in old.state_dict().items():self.assertTrue(torch.equal(value,new.state_dict()[key]),key)
+            x=observations(2,4,32)
+            with torch.no_grad():a,b=old(x),new(x)
+            self.assertTrue(torch.equal(a['vertices_4d'],b['vertices_4d']))
+            self.assertTrue(torch.equal(a['vertices_ref'],b['vertices_ref']))
+            for key in ('coarse','medium','fine_motion','regions'):
+                self.assertTrue(torch.equal(a['control_grids'][key],b['control_grids'][key]))
+            criterion=NeuralFFDLoss(new.chamber_ranges,new.faces)
+            target=a['vertices_4d']+.2
+            for output in (a,b):
+                losses=criterion(output,target,slice_result={'total':output['vertices_4d'].sum()*0+.12},
+                    control_spacings_mm=new.control_spacings_mm,regional_spacing_mm=new.regional_spacing_mm)
+                if output is a:reference=losses
+                else:
+                    self.assertEqual(set(losses['terms']),set(reference['terms']))
+                    self.assertEqual(len(losses['terms']),9)
+                    for key,value in losses['terms'].items():self.assertTrue(torch.equal(value,reference['terms'][key]),key)
+            save_checkpoint(path,new,None,config={},identity={'val':'fixed'})
+            restored,_=load_checkpoint(path)
+            with torch.no_grad():torch.testing.assert_close(restored.eval()(x)['vertices_4d'],b['vertices_4d'],rtol=0,atol=0)
+        configure_trainable(new,{'freeze':'dynamic_only'})
+        self.assertTrue(all(p.requires_grad==name.startswith('dynamic_conditioner.') for name,p in new.named_parameters()))
+        configure_trainable(old,{'freeze':'motion_head_only'})
+        self.assertFalse(old.deform3.reference.weight.requires_grad)
+        self.assertTrue(old.deform3.motion.weight.requires_grad)
+        new.decoder_config['lower_mm']=[-11.,-10.,-10.]
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'source.pth';save_checkpoint(path,old,None,config={},identity={'val':'fixed'})
+            with self.assertRaisesRegex(ValueError,'configuration'):initialize_from_checkpoint(new,path,{'val':'fixed'})
+
+    def test_query_reads_are_reused_and_adjacent_difference_has_correct_index(self):
+        from unittest.mock import patch
+        net=small_model(frames=24,dynamic_spatial='query_difference_v1').eval()
+        with torch.no_grad():encoded=net.encode(observations(1,24,32))
+        shape,motion=encoded['z_shape'],encoded['z_motion']
+        spatial=encoded['dynamic_spatial'];module=net.dynamic_conditioner
+        torch.nn.init.normal_(module.output.weight,std=.1)
+        with torch.no_grad(),patch.object(module,'_read',wraps=module._read) as reads,patch.object(
+                net.deform3,'motion_field',wraps=net.deform3.motion_field) as calls:
+            out=net.decode_4d(shape,motion,dynamic_spatial=spatial,return_details=True)
+            self.assertEqual(sum(call.args[1].shape[1] for call in reads.call_args_list),24)
+            self.assertEqual([call.args[-1] for call in calls.call_args_list],list(range(23)))
+            for phase,call in enumerate(calls.call_args_list):
+                field=calls._mock_wraps(*call.args)
+                torch.testing.assert_close(field,out['control_grids']['fine_motion'][:,phase+1])
+                torch.testing.assert_close(net._deform(out['vertices_4d'][:,phase],field,2),out['vertices_4d'][:,phase+1])
+            changed={key:value.clone() for key,value in spatial.items()}
+            changed['tokens'][:,12,:4] += .01*torch.randn_like(changed['tokens'][:,12,:4])
+            later=net.decode_4d(shape,motion,dynamic_spatial=changed,return_details=True)
+            self.assertTrue(torch.equal(out['vertices_4d'][:,:12],later['vertices_4d'][:,:12]))
+            self.assertFalse(torch.equal(out['control_grids']['fine_motion'][:,12],later['control_grids']['fine_motion'][:,12]))
+            self.assertTrue(torch.equal(out['vertices_ref'],later['vertices_ref']))
+
+    def test_missing_and_changed_annotation_never_create_placeholder_motion(self):
+        net=small_model(dynamic_spatial='query_difference_v1').eval()
+        torch.nn.init.normal_(net.dynamic_conditioner.output.weight,std=.1)
+        with torch.no_grad():encoded=net.encode(observations(2,4,32))
+        spatial=encoded['dynamic_spatial']
+        channels=torch.zeros_like(spatial['channel_valid'])
+        channels[:,0,0,0]=True;channels[:,1,0,1]=True
+        valid=channels.any(-1)[...,net.dynamic_conditioner.token_views]
+        changed=dict(tokens=spatial['tokens'].clone(),valid=valid,channel_valid=channels)
+        changed['tokens'][~valid]=float('nan')
+        with torch.no_grad():
+            with_branch=net.decode_4d(encoded['z_shape'],encoded['z_motion'],dynamic_spatial=changed)
+            without=net.decode_4d(encoded['z_shape'],encoded['z_motion'])
+        self.assertTrue(torch.equal(with_branch,without))
+        self.assertTrue(torch.isfinite(with_branch).all())
+        # A missing view between otherwise legal pairs is handled with common
+        # masks, not a subtraction of the unobserved read from its neighbor.
+        channels=spatial['channel_valid'].clone();channels[:,2,0]=False
+        changed=dict(tokens=spatial['tokens'],channel_valid=channels,
+            valid=channels.any(-1)[...,net.dynamic_conditioner.token_views])
+        with torch.no_grad():out=net.decode_4d(encoded['z_shape'],encoded['z_motion'],dynamic_spatial=changed)
+        self.assertTrue(torch.isfinite(out).all())
+
+    def test_branch_leaves_zero_then_has_finite_gradients_and_local_response(self):
+        from train_neural_ffd import configure_trainable
+        net=small_model(dynamic_spatial='query_difference_v1').eval()
+        with torch.no_grad():encoded=net.encode(observations(1,4,32))
+        shape,motion=encoded['z_shape'].detach(),encoded['z_motion'].detach()
+        spatial={key:value.detach() for key,value in encoded['dynamic_spatial'].items()}
+        configure_trainable(net,{'freeze':'dynamic_only'})
+        optimizer=torch.optim.Adam(net.dynamic_conditioner.parameters(),lr=.02)
+        with torch.no_grad():base=net.decode_4d(shape,motion)
+        target=base.clone();target[:,1:,:,0]+=torch.tensor([.03,.06,.04])[None,:,None]
+        for step in range(3):
+            optimizer.zero_grad();out=net.decode_4d(shape,motion,dynamic_spatial=spatial)
+            loss=(out-target).square().mean();loss.backward()
+            self.assertGreater(float(net.dynamic_conditioner.output.weight.grad.norm()),0.)
+            self.assertTrue(all(torch.isfinite(p.grad).all() for p in net.parameters() if p.grad is not None))
+            if step>0:self.assertGreater(float(net.dynamic_conditioner.attention.in_proj_weight.grad.norm()),0.)
+            optimizer.step()
+        leaf=spatial['tokens'].clone().requires_grad_(True);spatial=dict(spatial,tokens=leaf)
+        out=net.decode_4d(shape,motion,dynamic_spatial=spatial,return_details=True)
+        grad=torch.autograd.grad((out['vertices_4d']-target).square().mean(),leaf)[0]
+        self.assertGreater(float(grad.norm()),0.);self.assertTrue(torch.isfinite(grad).all())
+        changed=dict(spatial,tokens=leaf.detach().clone())
+        changed['tokens'][:,2,:4] += .01*torch.randn_like(changed['tokens'][:,2,:4])
+        with torch.no_grad():other=net.decode_4d(shape,motion,dynamic_spatial=changed,return_details=True)
+        delta=other['control_grids']['fine_motion'][:,2]-out['control_grids']['fine_motion'][:,2].detach()
+        self.assertGreater(float(delta.square().mean().sqrt()),1e-10)
+        self.assertGreater(float((delta-delta.mean((1,2,3),keepdim=True)).square().mean().sqrt()),1e-10)
+        self.assertTrue(torch.equal(other['vertices_4d'][:,:2],out['vertices_4d'][:,:2]))
+        self.assertGreater(float((other['vertices_4d'][:,2:]-out['vertices_4d'][:,2:].detach()).norm(dim=-1).max()),1e-9)
+
+    def test_batch_parity_and_zero_change_neutrality(self):
+        net=small_model(dynamic_spatial='query_difference_v1').eval()
+        torch.nn.init.normal_(net.dynamic_conditioner.output.weight,std=.1)
+        with torch.no_grad():
+            encoded=net.encode(observations(2,4,32))
+            together=net.decode_4d(**encoded)
+            for patient in range(2):
+                single=dict(z_shape=encoded['z_shape'][patient:patient+1],z_motion=encoded['z_motion'][patient:patient+1],
+                    dynamic_spatial={key:value[patient:patient+1] for key,value in encoded['dynamic_spatial'].items()})
+                torch.testing.assert_close(together[patient:patient+1],net.decode_4d(**single),atol=2e-6,rtol=1e-6)
+            features=net._reference(encoded['z_shape'])[1]
+            zero=features.new_zeros(2,8,*net.grid_shapes[1])
+            conditioned,stats=net.dynamic_conditioner.increment(features,zero)
+            self.assertTrue(torch.equal(features,conditioned))
+            self.assertEqual(float(stats.sum()),0.)
 
 
 class SpatialFusionTests(NeuralTestCase):
