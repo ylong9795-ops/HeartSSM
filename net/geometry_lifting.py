@@ -66,10 +66,12 @@ def feature_sampling_grid(model_pixels, image_shape, map_shape, backbone_stride)
         native_side = (size+backbone_stride-1)//backbone_stride
         if side > native_side or side < 2:
             raise ValueError('Lifting requires spatial maps no larger than the native CNN maps')
-        j = torch.arange(side,device=model_pixels.device,dtype=model_pixels.dtype)
-        start = torch.floor(j*native_side/side)
-        end = torch.ceil((j+1)*native_side/side)-1
-        centers = (start+end)*backbone_stride/2
+        # Pool bin endpoints are integer quantities. CUDA float division can
+        # round an exact integer slightly upward before ceil(), shifting the
+        # receptive center by half a backbone stride for selected bins.
+        centers = model_pixels.new_tensor([
+            (j*native_side//side + ((j+1)*native_side+side-1)//side-1)*backbone_stride/2
+            for j in range(side)])
         index = torch.searchsorted(centers,coordinate.contiguous()).clamp(1,side-1)
         fraction = (coordinate-centers[index-1])/(centers[index]-centers[index-1])
         feature_index = index-1+fraction
