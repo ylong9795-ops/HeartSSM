@@ -1,0 +1,31 @@
+version: goal04a2-preregistered-v2
+finalization: "Before any formal fixed-budget architecture training or VAL model comparison; local-response definitions clarified after untrained numerical probing. Original effect thresholds unchanged."
+baseline_commit: 80b4b4505c19bfb08ba82895bf421f52fe53fc6e
+pose_mode: known_pose
+data_config: configs/synthetic_data_1k.yaml
+train_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+val_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+seeds: [2026, 2027, 2028]
+variants: [A0, A1, A2, A3, A4]
+initialization: random; common modules have corresponding identical initialization
+updates: {shape: 32, motion: 96, joint: 16}
+learning_rate: 0.001
+batch_size: 1
+slice_target_mode: binary_native_v1
+selection: final fixed-budget checkpoint; TEST never read
+primary_metric: equal-patient/equal-chamber relative_motion_rmse_mm
+thresholds:
+  mean_relative_motion_reduction_at_least: 0.05
+  reference_shape_relative_regression_at_most: 0.02
+  full_4d_shape_relative_regression_at_most: 0.02
+  unobserved_motion_relative_regression_at_most: 0.02
+  motion_amplitude_ratio_range: [0.5, 1.5]
+  invalid_geometry_allowed: 0
+  local_response_target_region_reduction_required: true
+  local_clean_restoration_mean_target_rmse_relative_reduction_at_least: 0.01
+  local_response_target_rms_mm_at_least: 0.01
+  oracle_motion_relative_reduction_at_least: 0.10
+  direction_alignment_positive_required: true
+  paired_motion_reduction_95ci_lower_bound_positive_required: true
+uncertainty: paired patient bootstrap 95% CI and three independent seeds for A0/A4 and any retained best candidate
+full_1k_gate: engineering AND mechanism AND effect AND GPU viability AND completed soft/hard audit
