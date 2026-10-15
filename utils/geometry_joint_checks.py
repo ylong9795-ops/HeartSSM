@@ -61,10 +61,21 @@ def validate_template(model):
 
 
 @torch.no_grad()
-def validate_prediction(model, output, *, sample_jacobian=False, check_intersections=False):
+def validate_prediction(model, output, *, sample_jacobian=False, check_intersections=False,
+                        reference_only=False):
+    """Legacy24-phase audit, or explicit T=1 reference audit using the same core.
+
+    Reference mode rejects dynamic controls/trajectories rather than truncating
+    them. It audits exactly coarse -> medium -> fine0, without padded zero maps.
+    """
     if not getattr(model,'_template_self_intersection_checked',False):
         raise ValueError('Source template intersection check required before geometry certification')
     vertices = output['vertices_4d'].detach()
+    frames = 1 if reference_only else 24
+    if reference_only and (vertices.ndim != 4 or vertices.shape[1] != 1
+                           or output['control_grids']['fine'].ndim != 6
+                           or output['control_grids']['fine'].shape[1] != 1):
+        raise ValueError('Reference-only audit requires T=1 vertices and fine0 only')
     if (not torch.isfinite(vertices).all() or ((vertices < model.lower_mm) | (vertices > model.upper_mm)).any()):
         raise ValueError('Invalid finite/support geometry')
     degenerates = 0
@@ -88,7 +99,7 @@ def validate_prediction(model, output, *, sample_jacobian=False, check_intersect
     if check_intersections:
         crossings = 0
         for patient in range(len(vertices)):
-            for phase in range(24):
+            for phase in range(frames):
                 for c,(a,b) in zip(CHAMBERS,model.chamber_ranges.tolist()):
                     crossings += triangle_self_intersections(vertices[patient,phase,a:b].cpu().numpy(),
                                                               model.faces[c].cpu().numpy())
@@ -100,7 +111,7 @@ def validate_prediction(model, output, *, sample_jacobian=False, check_intersect
         p = model.template_vertices_mm[indices][None].expand(len(vertices),-1,-1).clone()
         jac = torch.eye(3,device=p.device,dtype=p.dtype).expand(len(p),len(indices),3,3).clone()
         minimum = float('inf')
-        fields = [(controls['coarse'],0),(controls['medium'],1)]+[(controls['fine'][:,t],2) for t in range(24)]
+        fields = [(controls['coarse'],0),(controls['medium'],1)]+[(controls['fine'][:,t],2) for t in range(frames)]
         epsilon = .02
         for field,level in fields:
             columns = []

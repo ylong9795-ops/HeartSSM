@@ -195,7 +195,7 @@ class MeshSliceSupervisor(nn.Module):
     def __init__(self, chamber_ranges, faces, norm_to_mm, *, sigma_mm=1., pixel_stride=4,
                  chunk_size=256, dice_weight=1., bce_weight=.1, boundary_weight=.1,
                  execution_backend='serial', cell_chunk_size=16,
-                 target_mode='binary_native_v1'):
+                 target_mode='binary_native_v1', supervision_grid='model_grid', reduction='cell_mean'):
         super().__init__()
         self.register_buffer('chamber_ranges',torch.as_tensor(chamber_ranges).long().clone())
         self._ranges = tuple(map(tuple,self.chamber_ranges.cpu().tolist()))
@@ -211,6 +211,11 @@ class MeshSliceSupervisor(nn.Module):
         if target_mode not in ('binary_native_v1','paired_soft_geometry_v1'):
             raise ValueError('Unknown slice supervision target mode')
         self.target_mode = target_mode
+        if supervision_grid not in ('model_grid','native_grid'):
+            raise ValueError('Supervision grid must be model_grid or native_grid')
+        if reduction not in ('cell_mean','chamber_mean'):
+            raise ValueError('Slice reduction must be cell_mean or chamber_mean')
+        self.supervision_grid,self.reduction=supervision_grid,reduction
         self.weights = dict(dice=dice_weight,bce=bce_weight,boundary_mm=boundary_weight)
         if (min(self.weights.values())<0 or sum(self.weights.values())<=0
                 or not np.isfinite(norm_to_mm) or norm_to_mm<=0):
@@ -234,19 +239,42 @@ class MeshSliceSupervisor(nn.Module):
                  (torch.special.entr(q)+torch.special.entr(1-q))).mean(-1),
             boundary_mm=((p-q).abs()*field.abs()).mean(-1))
 
+    def _reduce(self,values,chambers):
+        # Keep every annotated cell; no hard-cell mining or implicit masking.
+        if self.reduction=='cell_mean':
+            return {key:value.mean() for key,value in values.items()}
+        present=chambers.unique()
+        return {key:torch.stack([value[chambers==c].mean() for c in present]).mean()
+                for key,value in values.items()}
+
+    def _grid(self,observations,vertices):
+        if self.supervision_grid=='native_grid':
+            required=('native_masks','native_sdf','native_pixel_spacing','native_sdf_units')
+            if any(k not in observations for k in required):
+                raise ValueError('native_grid requires native_masks, native_sdf, native_pixel_spacing and native_sdf_units')
+            units=observations['native_sdf_units']
+            if units!='mm' and not (isinstance(units,(tuple,list)) and all(u=='mm' for u in units)):
+                raise ValueError('Native SDF must be physical mm')
+            return (observations['native_masks'].to(vertices),observations['native_sdf'].to(vertices),
+                    observations['native_pixel_spacing'].to(vertices))
+        return observations['masks'].to(vertices),observations['sdf'].to(vertices),observations['pixel_spacing'].to(vertices)
+
     def forward(self, vertices_4d, observations):
         if vertices_4d.ndim!=4 or vertices_4d.shape[-1]!=3:
             raise ValueError('Slice supervision requires [B,T,N,3] mesh trajectory')
         b,t,n,_ = vertices_4d.shape
-        masks,sdf = observations['masks'].to(vertices_4d),observations['sdf'].to(vertices_4d)
+        masks,sdf,spacings = self._grid(observations,vertices_4d)
         if masks.shape[:4]!=(b,t,3,4) or sdf.shape!=masks.shape or n!=self.chamber_ranges[-1,1]:
             raise ValueError('Mesh, mask, SDF and topology shapes differ')
         if 'phases_gt' in observations and not torch.equal(observations['phases'],observations['phases_gt']):
             raise ValueError('GT mesh/mask phases differ from observation phases')
         valid = observation_validity(observations,b,t,vertices_4d.device)
+        active=valid[...,None,None].expand_as(masks)
+        if (not torch.isfinite(masks[active]).all() or not torch.isfinite(sdf[active]).all()
+                or ((masks[active]!=0)&(masks[active]!=1)).any()):
+            raise ValueError('Finite physical SDF and binary slice targets required')
         pose = observations['pose_gt']
         rotations,translations = pose['probe_R'].to(vertices_4d),pose['probe_t'].to(vertices_4d)*self.norm_to_mm
-        spacings = observations['pixel_spacing'].to(vertices_4d)
         if rotations.shape!=(b,t,3,3,3) or translations.shape!=(b,t,3,3) or spacings.shape!=(b,t,3,2):
             raise ValueError('Pose/time/pixel-grid contract mismatch')
         gt = None
@@ -260,7 +288,8 @@ class MeshSliceSupervisor(nn.Module):
             return self._batched_forward(vertices_4d,masks,sdf,valid,rotations,translations,spacings,gt)
         values = {key:[] for key in self.weights}
         matched_empty = 0
-        for patient,frame,view,chamber in valid.nonzero().tolist():
+        cell_indices=valid.nonzero().tolist()
+        for patient,frame,view,chamber in cell_indices:
             left,right = self.chamber_ranges[chamber].tolist()
             target = masks[patient,frame,view,chamber,::self.pixel_stride,::self.pixel_stride]
             field = sdf[patient,frame,view,chamber,::self.pixel_stride,::self.pixel_stride]
@@ -295,12 +324,13 @@ class MeshSliceSupervisor(nn.Module):
         cells = int(valid.sum())
         if not cells or matched_empty==cells:
             raise ValueError('No informative plane sections in the supervised batch')
-        result = {key:torch.stack(value).mean() for key,value in values.items()}
+        result = self._reduce({key:torch.stack(value) for key,value in values.items()},
+                              torch.tensor([cell[3] for cell in cell_indices],device=vertices_4d.device))
         result['total'] = sum(self.weights[key]*result[key] for key in self.weights)
         result['diagnostics'] = dict(valid_cells=cells,matched_empty_sections=matched_empty,
                                      intersecting_cells=cells-matched_empty,pixel_stride=self.pixel_stride,
                                      soft_boundary_width_mm=self.sigma_mm)
-        result['diagnostics']['target_mode'] = self.target_mode
+        result['diagnostics'].update(target_mode=self.target_mode,supervision_grid=self.supervision_grid,reduction=self.reduction)
         if not torch.isfinite(result['total']):
             raise ValueError('Nonfinite slice supervision')
         return result
@@ -330,6 +360,7 @@ class MeshSliceSupervisor(nn.Module):
         pixel_points = torch.stack((xx,yy),-1).reshape(-1,2)
         values = {key:[] for key in self.weights}
         matched_empty = vertices.new_zeros((),dtype=torch.long)
+        chamber_indices=[]
         for chamber,(left,right) in enumerate(self._ranges):
             selected = [cell[:3] for cell in cells if cell[3]==chamber]
             for start in range(0,len(selected),self.cell_chunk_size):
@@ -360,18 +391,19 @@ class MeshSliceSupervisor(nn.Module):
                         teacher_soft = torch.where(teacher_present.any(-1)[:,None],
                             torch.sigmoid(-teacher_distance/self.sigma_mm),0.)
                 terms = self._terms(logits,truth,s,teacher_soft)
-                # Empty/empty cells contribute graph-connected zero, just as serial.
+                # Same cells/gradients in both reductions; absent sections retain zero.
+                chamber_indices.append(torch.full_like(patient,chamber))
                 for key,value in terms.items():
-                    values[key].append(torch.where(intersects,value,0.).sum())
+                    values[key].append(torch.where(intersects,value,0.))
         empty_count = int(matched_empty)
         if empty_count==len(cells):
             raise ValueError('No informative plane sections in the supervised batch')
-        result = {key:torch.stack(value).sum()/len(cells) for key,value in values.items()}
+        result = self._reduce({key:torch.cat(value) for key,value in values.items()},torch.cat(chamber_indices))
         result['total'] = sum(self.weights[key]*result[key] for key in self.weights)
         result['diagnostics'] = dict(valid_cells=len(cells),matched_empty_sections=empty_count,
             intersecting_cells=len(cells)-empty_count,pixel_stride=self.pixel_stride,
             soft_boundary_width_mm=self.sigma_mm)
-        result['diagnostics']['target_mode'] = self.target_mode
+        result['diagnostics'].update(target_mode=self.target_mode,supervision_grid=self.supervision_grid,reduction=self.reduction)
         if not torch.isfinite(result['total']):
             raise ValueError('Nonfinite slice supervision')
         return result

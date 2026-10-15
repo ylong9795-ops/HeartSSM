@@ -6,4 +6,5 @@ synthesis_data/
 outputs/
 docs/*
 docs/goal04a2/
-患者逐帧分割整理_20261015/
+real_data/
+*.pdf

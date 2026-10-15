@@ -1,0 +1,52 @@
+# Draft S2 A/B/C: calibrate/freeze ONE common2D weight on TRAIN before training.
+# Strict no-degradation defaults; tolerance1e-5 only covers floating-point noise.
+version: goal04s-refinement-v1
+base_protocol: configs/staged_heartffd_train800.yaml
+stage1_checkpoint: outputs/goal04s/train800_cosine40_complete_memoryfast/best.pth
+stage1_checkpoint_sha256: f4d9433c54e9ece157a09840a9739e8206f1b96de1dbd0736156a2d41cbd3ed2
+baseline_report: outputs/goal04s/train800_cosine40_complete_memoryfast/best_full_val/val_evaluation.json
+baseline_report_sha256: 73a0041d97db5499278561818743aa3a5dc573e0eeb4b2d37b091c5fb43c6cf6
+seed: 2026
+epochs: 6
+updates: 4800
+learning_rate: 0.0001
+minimum_learning_rate: 1.0e-05
+shape_weight: 1.0
+slice_weight: null
+prior_weight: 0.0
+gradient_target_ratio: 0.25
+calibration_indices:
+- 0
+- 1
+- 2
+- 3
+native_sdf_clip_mm: 15.0
+evaluate_every: 800
+checkpoint_every: 200
+slice:
+  sigma_mm: 1.0
+  pixel_stride: 4
+  chunk_size: 4096
+  dice_weight: 1.0
+  bce_weight: 0.1
+  boundary_weight: 0.1
+  execution_backend: batched
+  cell_chunk_size: 8
+  target_mode: binary_native_v1
+stride_schedule:
+- start_step: 0
+  pixel_stride: 4
+- start_step: 1600
+  pixel_stride: 2
+guards:
+  numeric_tolerance: 1.0e-05
+  maximum_degradation:
+    reference_vertex_rmse_mm: 0.0
+    reference_vertex_p95_mm: 0.0
+    surface_assd_mm: 0.0
+    surface_hd95_mm: 0.0
+    unknown_rmse_mm: 0.0
+    worst_reference_rmse_mm: 0.0
+    worst_surface_hd95_mm: 0.0
+    mean_absolute_volume_relative_error_percent: 0.0
+    worst_unknown_rmse_mm: 0.0
