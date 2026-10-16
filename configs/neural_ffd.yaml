@@ -22,6 +22,11 @@ decoder:
   regional_grid_shape: [4, 4, 4]
 slice:
   target_mode: paired_soft_geometry_v1
+  supervision_grid: native_grid
+  boundary_objective: paired_boundary_distance_v1
+  boundary_sample_step_mm: 0.5
+  boundary_fine_sample_step_mm: 0.25
+  boundary_fine_start_fraction: 0.75
   sigma_mm: 1.0
   pixel_stride: 4
   chunk_size: 256
@@ -29,9 +34,15 @@ slice:
   bce_weight: 0.1
   boundary_weight: 0.1
 loss:
+  objective_mode: grouped_gt_boundary_v1
+  observation_tail_fraction: 0.25
+  observation_tail_weight: 1.0
+  # Disabled pending TRAIN-only proxy calibration/ranking validation.
+  observation_boundary_threshold_mm: null
   huber_beta_mm: 1.0
   weights:
     shape: 1.0
+    trajectory: 1.0
     motion: 1.0
     velocity: 0.2
     volume: 0.01

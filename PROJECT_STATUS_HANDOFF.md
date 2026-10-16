@@ -1,6 +1,46 @@
 # HeartSSM 项目状态、研究证据与开发交接
 
-## 当前主线：2026-10-16 G1/G2 网络清理
+## 当前边界目标合同：2026-10-16 Native 标准与代理限制
+
+用户已预先明确：每个有效 Cell **Native Exact Dice≥.98** 为主要二维目标；Native ASSD≤.5mm、HD95≤1.0mm 暂作辅助诊断，不作为所有 Checkpoint 的硬拒绝条件。训练入口的 Exact 报告保留原始逐 Cell Dice/ASSD/HD95，并增加逐 Cell 标记、失败计数、最小值和全 Cell Dice 达标标志；未运行 Exact 时不会报告“全 Cell 通过”。冻结的 `utils/slice_evaluation.py` 未改。
+
+当前新模式的 `boundary_mm` 为平滑实际曲线距离及恢复/空目标物理项，旧 `legacy_probability_v1` 才是概率差/SDF 代理。二者均不等于 Native ASSD，**不能直接套用 .5mm**。两份主配置的 `observation_boundary_threshold_mm` 保持null，代码拒绝未经校准的数值阈值；代理 Pass/Fail 计数保持空值。未来如需阈值违反损失，只能用 TRAIN 中 Native Dice≥.98 且 ASSD≤.5mm 的合格数据按视图/腔室校准，并先验证 TRAIN 代理排序；本轮未执行这种校准，也未用 VAL 调参。
+
+`L_O` 继续按有效腔室等权聚合 Mean + TopKMean，TopK=各腔最大25%（向上取整、至少1个），β=1。残差明确拆成 `curve_mm`、`recovery_mm`、`empty_target_mm`，三者之和为 `boundary_mm`；不使用 Dice 加权 `cell_losses` 排序。空/空 Native Cell 为0；GT空而预测出现可见切面时，以 GT 物理半空间的平滑违反量抑制，余量固定为 `min(半个Native像素,GT到平面间隙)`，避免稀疏像素占据率失去梯度。曲线匹配、恢复、空目标、空/空及无可见GT边界分别标记，不把低恢复量伪装成边界达标。单个边界缺失在 Native 评价中是边界诊断失败；双空的 Dice 为1，边界诊断不适用。
+
+切面弧长采样独立于 Soft 网格 `pixel_stride=4`：主配置前期步长上限.5mm，Joint 进度≥.75后收紧为.25mm，实际步长还不超过原生像素间距。进度由既有epoch确定，恢复时重算，不增加网络前向、反向或候选试探。完整GT Shape/Motion监督继续作用于全部顶点，未增加Unknown冻结/模板吸附、患者TTO、硬约束线搜索或逐步回滚。
+
+完整50项测试通过，无失败/跳过，覆盖聚合目标GT驻点、有限位移/有限差分、空目标物理方向、细采样调度及冻结Native评价。TRAIN376参考帧的固定小位移检查，在.5/.25mm两种采样下均得到GT代理/梯度接近零，有限步后 `L_O` 分别 .077771→.067900、.077800→.067927；Native Dice均为7 Cell改善、A4C/LA一个Cell微降约2.6e-6，GT Native回绘像素差0。**代理下降不等于每Cell Exact Dice单调改善。** 证据：[grouped_observation_precision_smoke.json](outputs/slice_boundary_supervision_20261016/grouped_observation_precision_smoke.json)。该检查只有固定平移扰动，没有神经网络前向、训练或迭代患者拟合，不能视作网络泛化证据。
+
+最终验收仍须完整VAL100/全周期、逐Cell Native指标及完整3D、Unknown、GT Motion精度和独立几何检查。本轮没有执行该终评；正式NeuralFFD验证入口尚未接入单独Unknown分区评价，不能据本轮测试宣称最终验收完成。Unknown评价须沿用明确版本的区域定义后单独接线，不能为本轮发明一个有利阈值。
+
+## 当前主线补记：2026-10-16 分离 GT Shape、GT Motion 与边界目标
+
+本节优先于下文上一轮“三维 Loss 保持原样”的描述。`NeuralFFDLoss` 已增加显式 `L_S`、`L_M`、`L_O` 可微返回值；两份主配置启用 `grouped_gt_boundary_v1`，现有训练入口直接使用同一 `total.backward()`，并记录分组与诊断，没有增加模型前向、梯度投影或候选试探。
+
+- `L_S`：参考 GT Huber + 完整周期全顶点 GT Huber（新增 `trajectory`，权重1）+ 完整周期 GT edge/Laplacian/normal + Shape 控制正则。Unknown 顶点没有冻结、模板锚定或可见性过滤。
+- `L_M`：相对 GT 位移向量、含末帧→首帧的周期 Velocity、GT Volume，以及 Motion 控制正则。诊断分别返回四腔非参考相位的预测/GT位移 RMS、幅度比、运动方向余弦及定义有效标志；不把贴近旧网络运动作为目标。
+- `L_O`：直接读取已实现的逐 Cell `boundary_mm`；各腔计算均值与 TopK 均值后等权聚合。配置为尾部比例.25（向上取整、至少1个）、尾部系数1.0，属显式初始设置而非已验证最优参数。缺少观察的腔室显式报告并从聚合分母排除，不当成零误差；不将代理尾部宣称为 Exact Dice 未达标 Cell。
+- 控制正则按 Coarse/Medium/Fine0/区域 Shape 归 `L_S`，Fine1…23/区域 Motion 归 `L_M`；拆分 Fine 项时保留原 `1/T`、`(T-1)/T` 和各尺度/轴的平均分母，二者相加保持原总尺度。`terms.control` 保留作诊断，额外有效权重为0，防止重复计入。
+- `L_S` / `L_M` 含原分项权重，`L_O` 尚未乘外层系数；当前 `total = L_S + L_M + weights.slice * L_O`，两份主配置的 `weights.slice` 仍为.5。`objective_terms`、`objective_weights`、`active_weights` 明确记录计算合同。旧配置缺少新模式时保持 `legacy_v1`；参考 Shape 与预 Joint Motion 阶段的激活规则保留，全周期位置项仅在新 Joint 激活。
+
+新增13项测试覆盖全周期位置、Unknown GT梯度、GT Motion幅度/反向、周期接缝、均衡尾部及梯度、控制尺度/归属、历史阶段兼容和实际切片接线。完整40项测试通过，无失败/跳过；集成夹具确认一次模型前向、一次反向、一次优化器更新。Exact Renderer、网络和物理 FFD 源码未改。未启动训练、未提交 Git；本轮不实施软预算、Cell采样或几何安全准入改造，测试通过不代表训练精度或泛化已通过。
+
+## 当前主线补记：2026-10-16 逐 Cell Native 边界监督
+
+本节优先于下文清理记录中的“算法未改”等历史描述。用户本次授权修改二维监督；共享网络、物理 FFD、Exact Renderer、三维 Loss 及 Joint 参数更新规则保持原样。此前约定的“二维边界驱动、三维形状/运动预算保护、有限步参数更新”仍是后续整体目标，本轮只实现监督接口和边界方向。
+
+- `MeshSliceSupervisor` 现在返回可微 `cell_losses[C]`、`cell_terms` 与 `cell_indices[C,4]`，索引列为患者、相位槽、视图、腔室；同时返回可用的患者ID、实际周期相位及源帧索引。序列/批量输出按相同顺序排列，标注有效性决定 Cell，不以当前预测是否有交点过滤。
+- 两份主配置显式启用 `supervision_grid: native_grid`、`boundary_objective: paired_boundary_distance_v1`，继续使用 `paired_soft_geometry_v1`。Soft GT 与预测使用同一原生物理像素网格；边界项使用真实相交曲线的对称平滑距离（mm），以 Native spacing 约束弧长采样间隔，保留曲线坐标及弧长权重梯度。GT 分支 detach，不用二值栅格边界把精确 GT 推离。
+- 预测无交点时，使用原生视野内 GT 边界点到预测三角形表面的可微距离恢复切面；完整前景但视野内无 GT 曲线时使用实际前景像素。空/空 Cell 保留零项，伪切面接受配对空目标抑制，GT 与前景标签矛盾仍显式报错。`recovery_mm` 与缺失标志独立返回。
+- Joint 数据整理仅补齐 `native_masks` / `native_pixel_spacing` 的传递。不新增 Loss 系数；`total` 仍是兼容现有 trainer 的加权汇总。后续受约束优化器可直接使用逐 Cell `boundary_mm`，本轮未实现 Shape/Motion 预算、候选接受或参数回滚规则。
+- 新监督使用显式版本字段；缺少该字段的历史配置仍采用 `legacy_probability_v1`，不能冒称旧实验已使用新边界监督。原 checkpoint 推理不受此训练监督改动影响。
+
+验证：新增15项针对逐 Cell 隔离、GT驻点、各向异性矩形 Native 网格、边界/捕获有限差分、非刚性弧长梯度、有限步共享参数更新、无交点/空目标混合、视野外边界返回方向及旧模式兼容的测试；连同现有12项 TTO 测试共27项通过，无跳过。语法及空白检查通过，`utils/slice_evaluation.py` 与 HEAD 逐字节一致。
+
+另读取 TRAIN 首例376的参考相位作 float32 检查：8个有效 Native Cell，精确 GT 最大绝对 Cell Loss `9.71e-10`、最大顶点梯度 `6.84e-16`；共享位移扰动 `[.37,-.23,.19]mm` 的一次有限步更新使8个 Cell 的物理边界项均下降。证据：[train_reference_smoke.json](outputs/slice_boundary_supervision_20261016/train_reference_smoke.json)。此检查没有网络前向、网络训练或读取 VAL/TEST payload，不构成泛化或运动/几何预算通过证据。边界距离为弧长数值积分，跨越切面拓扑/最近对应切换时仍为分段可微；不能据此保证任意大步都改善 Exact 指标。
+
+## 仓库清理记录：2026-10-16 G1/G2 网络清理
 
 **本节记录最新仓库状态，优先于下文历史审计及后续补记中的“当前”“下一项”等表述。** 唯一保留的稀疏超声重建主线为 **NeuralFFDNet、物理 FFD、Native 切片、TTO 与几何安全**。保留 Shape64 / Motion32、渐进 Coarse→Medium→Fine 参考形变及递归运动；本轮没有新增网络、修改数学算法、启动训练或重跑研究队列。
 

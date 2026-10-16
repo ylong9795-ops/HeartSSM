@@ -17,6 +17,10 @@ from data.mask_transform import CHAMBERS
 from net.multiview_encoder import observation_validity
 
 
+OBSERVATION_KINDS = ('paired_boundary', 'recovery', 'matched_empty',
+                     'empty_target', 'no_visible_gt_boundary')
+
+
 class MissingSectionError(ValueError):
     pass
 
@@ -160,6 +164,148 @@ def batched_signed_segment_distance(points, segments, present, chunk_size=256):
     return torch.cat(distances,dim=1)
 
 
+
+def section_quadrature(segments, step_mm):
+    """Arc-length midpoint quadrature, at most one native pixel apart.
+
+    Integer sample counts are locally constant. Coordinates and arc-length
+    integration weights retain gradients, including for nonrigid curve changes.
+    No maximum silently drops small or complicated section components.
+    """
+    length = (segments[:, 1]-segments[:, 0]).norm(dim=-1)
+    counts = (length/step_mm).ceil().long().clamp_min(1)
+    owners = torch.repeat_interleave(torch.arange(len(segments), device=segments.device), counts)
+    offsets = counts.cumsum(0)-counts
+    slot = torch.arange(len(owners), device=segments.device)-offsets[owners]
+    fraction = (slot.to(segments)+.5)/counts[owners]
+    points = segments[owners, 0]+fraction[:, None]*(segments[owners, 1]-segments[owners, 0])
+    return points, length[owners]/counts[owners]
+
+
+def clip_section_to_native(segments, spacing_yx, image_shape):
+    """Clip curves to the physical support of native pixel centres/cells.
+
+    Pixel (0,0) is (-W/2*dx,-H/2*dy); its edges extend half a pixel.
+    Intersections with the FOV retain ordinary piecewise derivatives.
+    """
+    h, w = image_shape
+    spacing_xy = spacing_yx.flip(0)
+    lower = segments.new_tensor([-w/2-.5, -h/2-.5])*spacing_xy
+    upper = segments.new_tensor([w/2-.5, h/2-.5])*spacing_xy
+    a, delta = segments[:, 0], segments[:, 1]-segments[:, 0]
+    parallel = delta.abs() < 1e-12
+    safe = torch.where(parallel, torch.ones_like(delta), delta)
+    first, last = (lower-a)/safe, (upper-a)/safe
+    enter = torch.where(parallel, float('-inf'), torch.minimum(first, last)).amax(-1).clamp_min(0)
+    leave = torch.where(parallel, float('inf'), torch.maximum(first, last)).amin(-1).clamp_max(1)
+    keep = (leave > enter) & ~(parallel & ((a < lower) | (a > upper))).any(-1)
+    return torch.stack((a+enter[:, None]*delta, a+leave[:, None]*delta), 1)[keep]
+
+
+def _smooth_distance(distance, beta_mm):
+    # signed_segment_distance adds 1e-12 under its square root. Remove that
+    # numerical floor so identical curves have exactly zero loss.
+    squared = (distance.square()-1e-12).clamp_min(0)
+    return squared/((squared+beta_mm**2).sqrt()+beta_mm)
+
+
+def paired_boundary_distance(predicted, teacher, spacing_yx, image_shape, *, beta_mm=1., chunk_size=256,
+                             sample_step_mm=None):
+    """Symmetric physical curve distance (mm), with a smooth zero at equality.
+
+    GT->prediction covers all observed GT curve pieces. Prediction->GT covers
+    predicted pieces inside the native FOV. Distances use actual segments,
+    not a raster boundary or a binary-mask EDT. Detached GT uses the same
+    intersection operator, so rasterisation bias cannot push an exact GT away.
+    """
+    teacher = teacher.detach()
+    observed_gt = clip_section_to_native(teacher, spacing_yx, image_shape)
+    observed_pred = clip_section_to_native(predicted, spacing_yx, image_shape)
+    parts = []
+    step = spacing_yx.min().detach()
+    if sample_step_mm is not None:
+        step = torch.minimum(step, step.new_tensor(sample_step_mm))
+    for source, destination in ((observed_gt, predicted), (observed_pred, teacher)):
+        if len(source):
+            points, weight = section_quadrature(source, step)
+            distance = signed_segment_distance(points, destination, chunk_size)
+            parts.append((_smooth_distance(distance, beta_mm)*weight).sum()/weight.sum())
+    return torch.stack(parts).mean() if parts else predicted.sum()*0
+
+
+def surface_capture_distance(points_mm, vertices_mm, faces, *, beta_mm=1., chunk_size=64, weights=None):
+    """Target boundary -> closest triangle distance for an absent section.
+
+    Closest faces/barycentric coordinates are selected without autograd, then
+    the selected points are evaluated with gradients. By the envelope theorem
+    this is the ordinary derivative of point-to-surface distance almost
+    everywhere, including when the whole mesh lies on one side of the plane.
+    It supplies both normal-plane capture and in-plane localisation, without
+    correspondence fitting to GT vertices or inventing a section at padding.
+    """
+    distances = []
+    for points in points_mm.detach().split(chunk_size):
+        with torch.no_grad():
+            tri = vertices_mm.detach()[faces]
+            a, u, v = tri[:, 0], tri[:, 1]-tri[:, 0], tri[:, 2]-tri[:, 0]
+            uu, uv, vv = (u*u).sum(-1), (u*v).sum(-1), (v*v).sum(-1)
+            determinant = uu*vv-uv.square()
+            delta = points[:, None]-a
+            du, dv = (delta*u).sum(-1), (delta*v).sum(-1)
+            s = (du*vv-dv*uv)/determinant.clamp_min(1e-20)
+            t = (dv*uu-du*uv)/determinant.clamp_min(1e-20)
+            bary = torch.stack((1-s-t, s, t), -1)
+            candidates = [(bary, (s >= 0) & (t >= 0) & (s+t <= 1) & (determinant > 1e-20))]
+            for i, j in ((0, 1), (1, 2), (2, 0)):
+                edge = tri[:, j]-tri[:, i]
+                fraction = ((points[:, None]-tri[:, i])*edge).sum(-1)/edge.square().sum(-1).clamp_min(1e-20)
+                fraction = fraction.clamp(0, 1)
+                bary_edge = points.new_zeros(len(points), len(tri), 3)
+                bary_edge[..., i], bary_edge[..., j] = 1-fraction, fraction
+                candidates.append((bary_edge, torch.ones_like(fraction, dtype=torch.bool)))
+            best = points.new_full((len(points),), float('inf'))
+            face_ids = torch.zeros(len(points), device=faces.device, dtype=torch.long)
+            selected_bary = points.new_zeros(len(points), 3)
+            rows = torch.arange(len(points), device=faces.device)
+            for bary, allowed in candidates:
+                closest = (bary[..., None]*tri[None]).sum(-2)
+                squared = (points[:, None]-closest).square().sum(-1).masked_fill(~allowed, float('inf'))
+                value, ids = squared.min(-1)
+                improve = value < best
+                best = torch.minimum(best, value)
+                face_ids = torch.where(improve, ids, face_ids)
+                selected_bary = torch.where(improve[:, None], bary[rows, ids], selected_bary)
+        closest = (vertices_mm[faces[face_ids]]*selected_bary[..., None]).sum(-2)
+        squared = (points-closest).square().sum(-1)
+        distances.append(squared/((squared+beta_mm**2).sqrt()+beta_mm))
+    distances = torch.cat(distances)
+    return distances.mean() if weights is None else (distances*weights).sum()/weights.sum()
+
+
+def empty_section_clearance(vertices_mm, teacher_mm, rotation, translation_mm, spacing_yx, *, beta_mm=1.):
+    """Suppress a spurious section toward the empty GT's physical half-space.
+
+    The margin is min(half a native pixel, GT surface-to-plane clearance),
+    fixed by detached GT and acquisition spacing. The smooth hinge is zero
+    at GT and has a physical return direction even when no strided pixel
+    samples the spurious curve. This is an absence constraint, not a curve
+    ASSD, Dice threshold or correspondence/template attraction.
+    """
+    with torch.no_grad():
+        gt_normal = ((teacher_mm-translation_mm)@rotation)[..., 2]
+        if gt_normal.min() >= 0:
+            side, clearance = 1., gt_normal.min()
+        elif gt_normal.max() <= 0:
+            side, clearance = -1., -gt_normal.max()
+        else:
+            raise ValueError('Empty GT section has no consistent physical half-space')
+        margin = torch.minimum(clearance, spacing_yx.min()/2)
+    normal = ((vertices_mm-translation_mm)@rotation)[..., 2]
+    violation = (margin-side*normal).clamp_min(0)
+    squared = violation.square()
+    return (squared/((squared+beta_mm**2).sqrt()+beta_mm)).mean()
+
+
 def section_soft_mask(vertices_mm, faces, rotation, translation_mm, pixel_spacing,
                       image_shape, *, sigma_mm=1., pixel_stride=1, chunk_size=256,
                       require_intersection=False):
@@ -192,10 +338,25 @@ def section_soft_mask(vertices_mm, faces, rotation, translation_mm, pixel_spacin
 
 
 class MeshSliceSupervisor(nn.Module):
+    """Paired physical supervision with an unreduced per-cell autograd API.
+
+    ``cell_indices[C,4]`` identifies batch patient, phase slot, view and chamber
+    (canonical A2C/A3C/A4C and LV/LA/RV/RA). ``cell_losses[C]`` and every vector
+    in ``cell_terms`` retain gradients. Optional case IDs, actual cycle phases
+    and source frame indices accompany them. ``total`` and scalar component
+    keys remain available to existing callers as configured reductions.
+
+    ``paired_boundary_distance_v1`` requires paired GT, uses arc-length curve
+    distances in mm, and recovers missing predicted sections with distances
+    from observed GT boundary points to the predicted triangle surface.
+    ``legacy_probability_v1`` keeps historical target/loss behaviour.
+    """
     def __init__(self, chamber_ranges, faces, norm_to_mm, *, sigma_mm=1., pixel_stride=4,
                  chunk_size=256, dice_weight=1., bce_weight=.1, boundary_weight=.1,
                  execution_backend='serial', cell_chunk_size=16,
-                 target_mode='binary_native_v1', supervision_grid='model_grid', reduction='cell_mean'):
+                 target_mode='binary_native_v1', supervision_grid='model_grid', reduction='cell_mean',
+                 boundary_objective='legacy_probability_v1', boundary_sample_step_mm=None,
+                 boundary_fine_sample_step_mm=None, boundary_fine_start_fraction=.75):
         super().__init__()
         self.register_buffer('chamber_ranges',torch.as_tensor(chamber_ranges).long().clone())
         self._ranges = tuple(map(tuple,self.chamber_ranges.cpu().tolist()))
@@ -211,6 +372,24 @@ class MeshSliceSupervisor(nn.Module):
         if target_mode not in ('binary_native_v1','paired_soft_geometry_v1'):
             raise ValueError('Unknown slice supervision target mode')
         self.target_mode = target_mode
+        if boundary_objective not in ('legacy_probability_v1', 'paired_boundary_distance_v1'):
+            raise ValueError('Unknown boundary objective')
+        if boundary_objective == 'paired_boundary_distance_v1' and target_mode != 'paired_soft_geometry_v1':
+            raise ValueError('Paired boundary distances require paired soft GT supervision')
+        if boundary_objective == 'paired_boundary_distance_v1' and boundary_weight <= 0:
+            raise ValueError('Paired boundary supervision and section recovery require positive boundary_weight')
+        self.boundary_objective = boundary_objective
+        for step in (boundary_sample_step_mm, boundary_fine_sample_step_mm):
+            if step is not None and (not np.isfinite(step) or step <= 0):
+                raise ValueError('Boundary quadrature steps must be positive finite mm')
+        if (not np.isfinite(boundary_fine_start_fraction) or not 0 <= boundary_fine_start_fraction <= 1
+                or (boundary_fine_sample_step_mm is not None and boundary_sample_step_mm is None)
+                or (boundary_fine_sample_step_mm is not None and boundary_fine_sample_step_mm > boundary_sample_step_mm)):
+            raise ValueError('Declare a coarse step and a no-larger fine step with a start fraction in [0,1]')
+        self.boundary_sample_step_mm = boundary_sample_step_mm
+        self.boundary_fine_sample_step_mm = boundary_fine_sample_step_mm
+        self.boundary_fine_start_fraction = boundary_fine_start_fraction
+        self.joint_progress = 0.
         if supervision_grid not in ('model_grid','native_grid'):
             raise ValueError('Supervision grid must be model_grid or native_grid')
         if reduction not in ('cell_mean','chamber_mean'):
@@ -220,6 +399,18 @@ class MeshSliceSupervisor(nn.Module):
         if (min(self.weights.values())<0 or sum(self.weights.values())<=0
                 or not np.isfinite(norm_to_mm) or norm_to_mm<=0):
             raise ValueError('Nonnegative informative slice loss weights and physical scale required')
+
+    def set_joint_progress(self, progress):
+        """Deterministic epoch-derived schedule, restored without new forwards."""
+        if not np.isfinite(progress) or not 0 <= progress <= 1:
+            raise ValueError('Joint progress must be a finite fraction in [0,1]')
+        self.joint_progress = float(progress)
+
+    @property
+    def boundary_step_cap_mm(self):
+        if self.boundary_fine_sample_step_mm is not None and self.joint_progress >= self.boundary_fine_start_fraction:
+            return self.boundary_fine_sample_step_mm
+        return self.boundary_sample_step_mm
 
     def _terms(self,logits,truth,field,teacher_soft=None):
         """Same renderer, optional detached continuous GT target; no label edits.
@@ -249,6 +440,13 @@ class MeshSliceSupervisor(nn.Module):
 
     def _grid(self,observations,vertices):
         if self.supervision_grid=='native_grid':
+            if self.boundary_objective == 'paired_boundary_distance_v1':
+                if any(k not in observations for k in ('native_masks', 'native_pixel_spacing')):
+                    raise ValueError('Native boundary supervision requires native_masks and native_pixel_spacing')
+                masks = observations['native_masks'].to(vertices)
+                # Paired GT geometry supplies the continuous target. A binary
+                # EDT is neither required nor substituted for boundary distance.
+                return masks, None, observations['native_pixel_spacing'].to(vertices)
             required=('native_masks','native_sdf','native_pixel_spacing','native_sdf_units')
             if any(k not in observations for k in required):
                 raise ValueError('native_grid requires native_masks, native_sdf, native_pixel_spacing and native_sdf_units')
@@ -264,13 +462,15 @@ class MeshSliceSupervisor(nn.Module):
             raise ValueError('Slice supervision requires [B,T,N,3] mesh trajectory')
         b,t,n,_ = vertices_4d.shape
         masks,sdf,spacings = self._grid(observations,vertices_4d)
-        if masks.shape[:4]!=(b,t,3,4) or sdf.shape!=masks.shape or n!=self.chamber_ranges[-1,1]:
+        if (masks.ndim!=6 or masks.shape[:4]!=(b,t,3,4)
+                or (sdf is not None and sdf.shape!=masks.shape) or n!=self.chamber_ranges[-1,1]):
             raise ValueError('Mesh, mask, SDF and topology shapes differ')
         if 'phases_gt' in observations and not torch.equal(observations['phases'],observations['phases_gt']):
             raise ValueError('GT mesh/mask phases differ from observation phases')
         valid = observation_validity(observations,b,t,vertices_4d.device)
         active=valid[...,None,None].expand_as(masks)
-        if (not torch.isfinite(masks[active]).all() or not torch.isfinite(sdf[active]).all()
+        if (not torch.isfinite(masks[active]).all()
+                or (sdf is not None and not torch.isfinite(sdf[active]).all())
                 or ((masks[active]!=0)&(masks[active]!=1)).any()):
             raise ValueError('Finite physical SDF and binary slice targets required')
         pose = observations['pose_gt']
@@ -284,8 +484,10 @@ class MeshSliceSupervisor(nn.Module):
             gt = observations['vertices_gt'].to(vertices_4d).detach()
             if gt.shape != vertices_4d.shape or not torch.isfinite(gt).all():
                 raise ValueError('Paired soft slice targets require finite matching GT topology/phases')
+        if self.boundary_objective == 'paired_boundary_distance_v1':
+            return self._boundary_forward(vertices_4d, masks, valid, rotations, translations, spacings, gt, observations)
         if self.execution_backend=='batched':
-            return self._batched_forward(vertices_4d,masks,sdf,valid,rotations,translations,spacings,gt)
+            return self._batched_forward(vertices_4d,masks,sdf,valid,rotations,translations,spacings,gt,observations)
         values = {key:[] for key in self.weights}
         matched_empty = 0
         cell_indices=valid.nonzero().tolist()
@@ -324,7 +526,8 @@ class MeshSliceSupervisor(nn.Module):
         cells = int(valid.sum())
         if not cells or matched_empty==cells:
             raise ValueError('No informative plane sections in the supervised batch')
-        result = self._reduce({key:torch.stack(value) for key,value in values.items()},
+        packed = {key:torch.stack(value) for key,value in values.items()}
+        result = self._reduce(packed,
                               torch.tensor([cell[3] for cell in cell_indices],device=vertices_4d.device))
         result['total'] = sum(self.weights[key]*result[key] for key in self.weights)
         result['diagnostics'] = dict(valid_cells=cells,matched_empty_sections=matched_empty,
@@ -333,9 +536,162 @@ class MeshSliceSupervisor(nn.Module):
         result['diagnostics'].update(target_mode=self.target_mode,supervision_grid=self.supervision_grid,reduction=self.reduction)
         if not torch.isfinite(result['total']):
             raise ValueError('Nonfinite slice supervision')
+        return self._attach_cells(result, cell_indices, packed, observations)
+
+    def _attach_cells(self, result, indices, terms, observations=None, missing=None, kinds=None):
+        """Expose unreduced autograd tensors in canonical [B,T,V,C] order."""
+        # Lexicographic sorting is independent of the serial/batched execution.
+        order = sorted(range(len(indices)), key=lambda i: tuple(indices[i]))
+        indices = torch.as_tensor(indices, device=self.chamber_ranges.device, dtype=torch.long)[order]
+        terms = {key: value[order] for key, value in terms.items()}
+        result['cell_indices'] = indices
+        result['cell_index_columns'] = ('patient', 'phase', 'view', 'chamber')
+        result['cell_terms'] = terms
+        result['cell_losses'] = sum(self.weights[key]*terms[key] for key in self.weights)
+        if missing is not None:
+            result['cell_missing_sections'] = torch.as_tensor(missing, device=indices.device, dtype=torch.bool)[order]
+        if kinds is not None:
+            result['cell_observation_kind'] = torch.as_tensor(kinds, device=indices.device, dtype=torch.long)[order]
+            result['cell_observation_kind_names'] = OBSERVATION_KINDS
+        if observations is not None:
+            owners, phases = indices[:, 0], indices[:, 1]
+            if 'case_id' in observations:
+                identities = observations['case_id']
+                result['cell_case_ids'] = [identities[int(owner)] for owner in owners]
+            for source, target in (('phases', 'cell_phases'), ('frame_indices', 'cell_frame_indices')):
+                if source in observations:
+                    result[target] = observations[source].to(indices.device)[owners, phases]
         return result
 
-    def _batched_forward(self, vertices, masks, sdf, valid, rotations, translations, spacings,gt=None):
+    def _boundary_forward(self, vertices, masks, valid, rotations, translations, spacings, gt, observations):
+        """Versioned paired boundary objective; aggregate keys stay compatible.
+
+        The unreduced boundary_mm vector is the primary geometric signal for
+        a future constrained optimiser. total retains the caller's configured
+        reduction/weights; this module does not implement a new Joint solver.
+        """
+        active = valid.any(-1)
+        r, tr, spacing = rotations[active], translations[active], spacings[active]
+        eye = torch.eye(3, device=vertices.device, dtype=vertices.dtype)
+        if (not torch.isfinite(vertices).all() or not torch.isfinite(r).all()
+                or not torch.isfinite(tr).all() or not torch.isfinite(spacing).all() or (spacing <= 0).any()
+                or ((r.transpose(-1, -2)@r-eye).abs() > 1e-4).any() or (torch.linalg.det(r) <= 0).any()):
+            raise ValueError('Finite mesh, right-handed orthonormal poses and positive physical spacing required')
+        cells = valid.nonzero().cpu().tolist()
+        if not cells:
+            raise ValueError('No valid supervised cells')
+        h, w = masks.shape[-2:]
+        yy, xx = torch.meshgrid(torch.arange(0, h, self.pixel_stride, device=vertices.device, dtype=vertices.dtype)-h/2,
+                                torch.arange(0, w, self.pixel_stride, device=vertices.device, dtype=vertices.dtype)-w/2,
+                                indexing='ij')
+        pixel_points = torch.stack((xx, yy), -1).reshape(-1, 2)
+        values = {key: [] for key in (*self.weights, 'curve_mm', 'recovery_mm', 'empty_target_mm')}
+        ordered_cells, missing_cells, cell_kinds = [], [], []
+        empty_count = recovery_count = 0
+        chunk = 1 if self.execution_backend == 'serial' else self.cell_chunk_size
+        for chamber, (left, right) in enumerate(self._ranges):
+            selected = [cell for cell in cells if cell[3] == chamber]
+            faces = getattr(self, 'faces_'+CHAMBERS[chamber])
+            for start in range(0, len(selected), chunk):
+                entries = selected[start:start+chunk]
+                indices = torch.tensor(entries, device=vertices.device)
+                patient, frame, view, _ = indices.unbind(-1)
+                v = vertices[patient, frame, left:right]
+                r, tr, spacing = rotations[patient, frame, view], translations[patient, frame, view], spacings[patient, frame, view]
+                segments, present = batched_plane_segments(v, faces, r, tr)
+                intersects = present.any(-1)
+                points = pixel_points[None]*spacing[:, None, [1, 0]]
+                with torch.no_grad():
+                    teacher_segments, teacher_present = batched_plane_segments(gt[patient, frame, left:right], faces, r, tr)
+                    teacher_intersects = teacher_present.any(-1)
+                    teacher_soft = points.new_zeros(points.shape[:2])
+                    if teacher_intersects.any():
+                        teacher_distance = batched_signed_segment_distance(points[teacher_intersects],
+                            teacher_segments[teacher_intersects], teacher_present[teacher_intersects], self.chunk_size)
+                        teacher_soft[teacher_intersects] = torch.sigmoid(-teacher_distance/self.sigma_mm)
+                # Never evaluate nearest distance against a dummy padded segment.
+                logits = points.new_zeros(points.shape[:2])
+                if intersects.any():
+                    distance = batched_signed_segment_distance(points[intersects], segments[intersects], present[intersects], self.chunk_size)
+                    logits = logits.index_copy(0, intersects.nonzero().flatten(), -distance/self.sigma_mm)
+                for row, cell in enumerate(entries):
+                    p, t, view_id, c = cell
+                    zero = v[row].sum()*0
+                    curve_loss = recovery = empty_target = zero
+                    foreground = bool(masks[p, t, view_id, c].any())
+                    teacher_curve = teacher_segments[row, teacher_present[row]]
+                    pred_curve = segments[row, present[row]]
+                    if foreground and not bool(teacher_intersects[row]):
+                        raise MissingSectionError(f'GT section absent for observed foreground cell {cell}')
+                    if bool(intersects[row]):
+                        truth = masks[p, t, view_id, c, ::self.pixel_stride, ::self.pixel_stride].flatten()[None]
+                        terms = {key: value[0] for key, value in self._terms(logits[row:row+1], truth,
+                            torch.zeros_like(truth), teacher_soft[row:row+1]).items()}
+                        if len(teacher_curve):
+                            curve_loss = paired_boundary_distance(pred_curve, teacher_curve,
+                                spacing[row], (h, w), beta_mm=self.sigma_mm, chunk_size=self.chunk_size,
+                                sample_step_mm=self.boundary_step_cap_mm)
+                            visible_gt = clip_section_to_native(teacher_curve, spacing[row], (h, w))
+                            kind = 'paired_boundary' if len(visible_gt) else 'no_visible_gt_boundary'
+                        else:
+                            visible_pred = clip_section_to_native(pred_curve, spacing[row], (h, w))
+                            if len(visible_pred) or bool((logits[row] >= 0).any()):
+                                empty_target = empty_section_clearance(v[row], gt[p, t, left:right],
+                                    r[row], tr[row], spacing[row], beta_mm=self.sigma_mm)
+                                kind = 'empty_target'
+                            else:
+                                kind = 'matched_empty'
+                                empty_count += 1
+                        terms['boundary_mm'] = curve_loss+empty_target
+                    else:
+                        observed_curve = clip_section_to_native(teacher_curve, spacing[row], (h, w))
+                        if len(observed_curve) or foreground:
+                            if len(observed_curve):
+                                step = spacing[row].min()
+                                if self.boundary_step_cap_mm is not None:
+                                    step = torch.minimum(step, step.new_tensor(self.boundary_step_cap_mm))
+                                capture_points, weight = section_quadrature(observed_curve, step)
+                            else:
+                                # A full foreground FOV can contain no visible
+                                # GT boundary. Use its actual native pixels.
+                                pixels = masks[p, t, view_id, c].nonzero().to(vertices)
+                                capture_points = (pixels[:, [1, 0]]-vertices.new_tensor([w/2, h/2]))*spacing[row].flip(0)
+                                weight = None
+                            world = F.pad(capture_points, (0, 1))@r[row].T+tr[row]
+                            recovery = surface_capture_distance(world, v[row], faces, beta_mm=self.sigma_mm, weights=weight)
+                            terms = dict(dice=zero+1, bce=zero, boundary_mm=recovery)
+                            kind = 'recovery'
+                            recovery_count += 1
+                        else:
+                            terms = dict(dice=zero, bce=zero, boundary_mm=zero)
+                            kind = 'matched_empty'
+                            empty_count += 1
+                    for key in self.weights:
+                        values[key].append(terms[key])
+                    values['recovery_mm'].append(recovery)
+                    values['curve_mm'].append(curve_loss)
+                    values['empty_target_mm'].append(empty_target)
+                    ordered_cells.append(cell)
+                    missing_cells.append(not bool(intersects[row]))
+                    cell_kinds.append(OBSERVATION_KINDS.index(kind))
+        packed = {key: torch.stack(value) for key, value in values.items()}
+        chambers = torch.tensor([cell[3] for cell in ordered_cells], device=vertices.device)
+        result = self._reduce({key: packed[key] for key in self.weights}, chambers)
+        result['total'] = sum(self.weights[key]*result[key] for key in self.weights)
+        result['diagnostics'] = dict(valid_cells=len(cells), matched_empty_sections=empty_count,
+            missing_predicted_sections=sum(missing_cells), recovery_cells=recovery_count,
+            intersecting_cells=len(cells)-sum(missing_cells), pixel_stride=self.pixel_stride,
+            soft_boundary_width_mm=self.sigma_mm, target_mode=self.target_mode,
+            supervision_grid=self.supervision_grid, reduction=self.reduction, boundary_objective=self.boundary_objective,
+            boundary_units='mm', boundary_quadrature='native_pixel_spacing',
+            boundary_smoothing_mm=self.sigma_mm,
+            boundary_sample_step_cap_mm=self.boundary_step_cap_mm, joint_progress=self.joint_progress,
+            empty_target_policy='detached_gt_half_space; margin=min(native_half_pixel,gt_clearance)')
+        if not all(torch.isfinite(value).all() for value in packed.values()):
+            raise ValueError('Nonfinite per-cell slice supervision')
+        return self._attach_cells(result, ordered_cells, packed, observations, missing_cells, cell_kinds)
+
+    def _batched_forward(self, vertices, masks, sdf, valid, rotations, translations, spacings,gt=None,observations=None):
         # Validate once instead of synchronizing CPU/GPU for every cell.
         active_views = valid.any(-1)
         r,tr,spacing = rotations[active_views],translations[active_views],spacings[active_views]
@@ -361,6 +717,7 @@ class MeshSliceSupervisor(nn.Module):
         values = {key:[] for key in self.weights}
         matched_empty = vertices.new_zeros((),dtype=torch.long)
         chamber_indices=[]
+        ordered_cells=[]
         for chamber,(left,right) in enumerate(self._ranges):
             selected = [cell[:3] for cell in cells if cell[3]==chamber]
             for start in range(0,len(selected),self.cell_chunk_size):
@@ -392,13 +749,15 @@ class MeshSliceSupervisor(nn.Module):
                             torch.sigmoid(-teacher_distance/self.sigma_mm),0.)
                 terms = self._terms(logits,truth,s,teacher_soft)
                 # Same cells/gradients in both reductions; absent sections retain zero.
+                ordered_cells.extend([(*cell, chamber) for cell in selected[start:start+self.cell_chunk_size]])
                 chamber_indices.append(torch.full_like(patient,chamber))
                 for key,value in terms.items():
                     values[key].append(torch.where(intersects,value,0.))
         empty_count = int(matched_empty)
         if empty_count==len(cells):
             raise ValueError('No informative plane sections in the supervised batch')
-        result = self._reduce({key:torch.cat(value) for key,value in values.items()},torch.cat(chamber_indices))
+        packed = {key:torch.cat(value) for key,value in values.items()}
+        result = self._reduce(packed,torch.cat(chamber_indices))
         result['total'] = sum(self.weights[key]*result[key] for key in self.weights)
         result['diagnostics'] = dict(valid_cells=len(cells),matched_empty_sections=empty_count,
             intersecting_cells=len(cells)-empty_count,pixel_stride=self.pixel_stride,
@@ -406,7 +765,7 @@ class MeshSliceSupervisor(nn.Module):
         result['diagnostics'].update(target_mode=self.target_mode,supervision_grid=self.supervision_grid,reduction=self.reduction)
         if not torch.isfinite(result['total']):
             raise ValueError('Nonfinite slice supervision')
-        return result
+        return self._attach_cells(result, ordered_cells, packed, observations)
 
 
 def exact_section_mask(vertices_mm, faces, rotation, translation_mm, pixel_spacing, image_shape):

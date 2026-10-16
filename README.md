@@ -166,7 +166,8 @@ benchmark runner was removed in an earlier cleanup.
 checkpoints/configs and consolidated engineering reports are in `outputs/archive/`.
 Completed one-step smoke checkpoint directories were removed after preserving
 summaries, gradient/timing evidence and test logs. The current test suite is
-`tests/test_real_tto.py`; older auxiliary test runners were retired separately.
+`tests/test_real_tto.py`, `tests/test_slice_supervision.py` and
+`tests/test_neural_ffd_losses.py`; older auxiliary test runners were retired separately.
 The parallel input/evaluation runtime owns process lifetimes and caches.
 
 See the [configuration](configs/neural_ffd.yaml) and
@@ -226,6 +227,87 @@ and original label renderer against saved native labels. GT native rerendering
 must match those labels pixel for pixel. Soft GT targets never replace native
 labels or change Hard Dice. `binary_native_v1` remains available for historical
 saved configurations; resuming a run uses its identical saved config.
+
+Both main configs now additionally select `supervision_grid: native_grid` and
+`boundary_objective: paired_boundary_distance_v1`. Soft GT and prediction use
+the source pixel centres and measured y/x spacing. The boundary term measures
+symmetric distances between actual GT/predicted section curves in mm, with
+arc-length samples at most one native pixel apart and a smooth zero at matching
+curves. This avoids using a rasterised binary boundary as a force on exact GT.
+Observed curve pieces are restricted to the native FOV. Missing predicted
+sections receive a differentiable distance from observed GT boundary points to
+the predicted triangle surface; matched empty cells remain explicit zero cells.
+
+`MeshSliceSupervisor` returns `cell_indices[C,4]` (patient, phase slot, view,
+chamber), differentiable `cell_losses[C]` and `cell_terms` vectors including
+`boundary_mm` and `recovery_mm`. Case IDs, actual phases and source frame indices
+are included when supplied. Consumers can inspect or differentiate individual
+cells; `total` remains the configured aggregate for the existing trainer.
+Joint collation retains native labels/spacing. No constrained Joint optimiser
+or Shape/Motion error-budget protection is implemented by this change.
+
+The new objective is explicitly versioned in the main configs. Historical
+configs without `boundary_objective` retain `legacy_probability_v1` behaviour;
+old saved experiments must not be described as using the new supervision.
+The current suite includes `tests/test_slice_supervision.py` for stationary GT,
+physical boundary directions, finite parameter steps and missing-section recovery.
+
+Both main configs also select `loss.objective_mode: grouped_gt_boundary_v1`.
+`NeuralFFDLoss` returns differentiable `L_S`, `L_M`, `L_O`, plus `total`:
+
+| Objective | Active Joint components |
+| --- | --- |
+| `L_S` | Reference Shape + all-phase GT vertex Huber + GT edge/Laplacian/normal supervision + Shape control regularity |
+| `L_M` | Relative GT displacement + cyclic velocity (including last→first) + GT volume + Motion control regularity |
+| `L_O` | Equal-chamber mean of physical `boundary_mm` mean + TopK mean |
+
+Each observed chamber's tail contains `ceil(0.25 * cell_count)` cells, at least
+one, with tail coefficient 1.0. These are explicit starting settings, not tuned
+accuracy thresholds. Unobserved chambers are reported and excluded from the
+chamber average. This aggregation consumes `cell_terms.boundary_mm` directly,
+independently of the slicer's Dice/BCE weights or aggregate `total`.
+
+The per-cell residual is explicitly decomposed into `curve_mm`, `recovery_mm`
+and `empty_target_mm`; their sum is `boundary_mm`. A matched Native empty cell
+has zero residual. For an empty GT section with an observable spurious prediction,
+a smooth half-space violation moves it toward the GT side of the plane, with
+margin `min(native_half_pixel, GT_clearance)`. This avoids a sparse-pixel
+occupancy surrogate losing its gradient. Observation-kind flags distinguish
+curve matches, recovery, empty targets, matched empty and invisible GT boundaries.
+
+The primary evaluation goal is **Native Exact Dice >= 0.98 for every valid
+Cell**. Native boundary ASSD <= 0.5 mm and HD95 <= 1.0 mm are diagnostic goals,
+not automatic checkpoint rejection rules. Exact reports include per-cell
+values/flags, failing counts and the all-cell Dice result. Empty/empty has
+Dice=1 and boundary diagnostics marked inapplicable; a single absent boundary
+fails the boundary diagnostic. The frozen renderer is unchanged.
+
+`observation_boundary_threshold_mm` stays `null`: uncalibrated numeric proxy
+thresholds are rejected, including a direct 0.5 mm proxy cutoff. A future proxy
+threshold requires TRAIN-only qualifying cells (Native Dice >= .98 and ASSD
+<= .5 mm), separate view/chamber calibration and validated proxy ranking.
+No proxy-threshold violation loss is active. TopK denotes largest residuals,
+not Native Exact failures.
+
+Curve quadrature is independent of Soft `pixel_stride=4`. Main configs cap the
+arc-length step at 0.5 mm, tightening to 0.25 mm after 75% of Joint epochs;
+actual steps never exceed native spacing. The epoch-derived schedule is
+deterministic on resume and adds no model forward. A finer surrogate still
+does not guarantee every Cell's discrete Exact Dice improves in one update.
+
+Shape/Motion groups include their component weights; the combined objective is
+`L_S + L_M + weights.slice * L_O`. Coarse, Medium, Fine0 and regional Shape
+regularity belong to Shape; Fine1…23 and regional Motion regularity belong to
+Motion. Their sum preserves the previous control regularizer's scale, and the
+diagnostic aggregate `terms.control` has zero additional active weight.
+All vertices, including unobserved regions, retain full GT supervision.
+No template attraction or Unknown-vertex freeze is added.
+
+The trainer logs each objective, per-chamber boundary mean/tail and GT-relative
+motion amplitude/direction diagnostics, using the existing single forward and
+backward. Historical configs default to `legacy_v1`; pre-Joint Shape/Motion
+stage activation is retained. All-phase position loss is newly active in Joint.
+Soft error-budget penalties and Cell subsampling remain separate work.
 
 The two `neural_ffd_1k_known_pose*.yaml` research configs and Encoder Pose branch
 were retired. Their source remains in Git history at `1999287c`; existing

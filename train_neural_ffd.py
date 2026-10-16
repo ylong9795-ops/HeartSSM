@@ -36,6 +36,7 @@ from utils.validation_runtime import ValidationRuntime,reference_signature
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 'neural-heartffd-checkpoint-v1'
+NATIVE_JOINT_CRITERIA = dict(dice_min=.98, boundary_assd_max_mm=.5, boundary_hd95_max_mm=1.)
 
 
 def repository_path(value):
@@ -100,6 +101,9 @@ def to_device(value,device,non_blocking=False):
 def training_collate(samples,stage):
     """Exclude evaluation-only arrays before IPC and pinned-memory copies."""
     unused = {'native_masks','model_to_native','native_pixel_spacing','clipped_foreground'}
+    if stage == 'joint':
+        # Paired boundary supervision queries the source physical grid.
+        unused.difference_update(('native_masks', 'native_pixel_spacing'))
     # Physical acquisition geometry is needed only for joint slice supervision.
     if stage != 'joint':
         unused.update(('pose_gt','pixel_spacing','norm_to_mm'))
@@ -341,6 +345,25 @@ def boundary_metrics(prediction,truth,spacing,reference=None):
     return dict(boundary_assd_mm=float(distances.mean()),boundary_hd95_mm=float(np.quantile(distances,.95)),empty_boundary=None)
 
 
+def native_cell_criteria(exact_dice, boundary):
+    """Predeclared Exact goals; boundary flags are diagnostics, not rejection.
+
+    Empty/empty has Dice=1 but no boundary to evaluate. One absent boundary
+    is a failed boundary diagnostic, never a zero-distance success.
+    """
+    empty = boundary['empty_boundary']
+    if empty == 'both':
+        assd_pass = hd95_pass = None
+    elif empty == 'one':
+        assd_pass = hd95_pass = False
+    else:
+        assd_pass = bool(boundary['boundary_assd_mm'] <= NATIVE_JOINT_CRITERIA['boundary_assd_max_mm'])
+        hd95_pass = bool(boundary['boundary_hd95_mm'] <= NATIVE_JOINT_CRITERIA['boundary_hd95_max_mm'])
+    return dict(native_dice_pass=bool(exact_dice >= NATIVE_JOINT_CRITERIA['dice_min']),
+                native_assd_diagnostic_pass=assd_pass, native_hd95_diagnostic_pass=hd95_pass,
+                native_boundary_diagnostic_pass=(None if assd_pass is None else assd_pass and hd95_pass))
+
+
 def exact_metrics(model,predicted,batch,reference_cache=None):
     """Predicted mesh + original pose -> source renderer -> original-label Dice.
 
@@ -392,21 +415,30 @@ def exact_metrics(model,predicted,batch,reference_cache=None):
         def dice(a,b):
             mass = int(a.sum())+int(b.sum())
             return float(2*(a.astype(bool)&b.astype(bool)).sum()/mass) if mass else 1.
+        exact_dice = dice(pm,target)
+        boundary = boundary_metrics(pm,target,spacing[patient,frame,view],reference)
         rows.append(dict(patient=int(patient),frame=int(frame),view=VIEWS[view],chamber=c,
-            exact_dice=dice(pm,target),paired_exact_dice=dice(pm,target),gt_saved_mask_dice=1.,
-            gt_native_pixel_mismatches=0,
-            **boundary_metrics(pm,target,spacing[patient,frame,view],reference)))
+            exact_dice=exact_dice,paired_exact_dice=exact_dice,gt_saved_mask_dice=1.,
+            gt_native_pixel_mismatches=0, **boundary, **native_cell_criteria(exact_dice, boundary)))
     values = np.array([r['exact_dice'] for r in rows])
     if not len(values):
         raise ValueError('No valid exact evaluation cells')
     summary = dict(cells=len(rows),mean_exact_dice=float(values.mean()),p05_exact_dice=float(np.quantile(values,.05)),
+                   minimum_exact_dice=float(values.min()), all_native_dice_pass=bool((values>=.98).all()),
                    fraction_dice_ge_095=float((values>=.95).mean()),fraction_dice_ge_098=float((values>=.98).mean()),
+                   native_dice_pass_cells=sum(r['native_dice_pass'] for r in rows),
+                   native_dice_fail_cells=sum(not r['native_dice_pass'] for r in rows),
+                   native_boundary_diagnostic_pass_cells=sum(r['native_boundary_diagnostic_pass'] is True for r in rows),
+                   native_boundary_diagnostic_fail_cells=sum(r['native_boundary_diagnostic_pass'] is False for r in rows),
+                   native_boundary_not_applicable_cells=sum(r['native_boundary_diagnostic_pass'] is None for r in rows),
                    minimum_gt_saved_mask_dice=min(r['gt_saved_mask_dice'] for r in rows),
                    gt_native_pixel_mismatches=sum(r['gt_native_pixel_mismatches'] for r in rows))
     def group(selected):
         scores = np.array([r['exact_dice'] for r in selected])
         valid_distances = [r for r in selected if r['boundary_assd_mm'] is not None]
         return dict(cells=len(selected),mean_exact_dice=float(scores.mean()),
+            minimum_exact_dice=float(scores.min()), all_native_dice_pass=bool((scores>=.98).all()),
+            native_dice_fail_cells=int((scores<.98).sum()),
             p05_exact_dice=float(np.quantile(scores,.05)),fraction_dice_ge_095=float((scores>=.95).mean()),
             fraction_dice_ge_098=float((scores>=.98).mean()),
             mean_boundary_assd_mm=float(np.mean([r['boundary_assd_mm'] for r in valid_distances])) if valid_distances else None,
@@ -414,7 +446,8 @@ def exact_metrics(model,predicted,batch,reference_cache=None):
             missing_one_boundary_cells=sum(r['empty_boundary']=='one' for r in selected))
     summary['per_view'] = {v:group([r for r in rows if r['view']==v]) for v in VIEWS if any(r['view']==v for r in rows)}
     summary['per_chamber'] = {c:group([r for r in rows if r['chamber']==c]) for c in CHAMBERS if any(r['chamber']==c for r in rows)}
-    return dict(renderer=renderer,summary=summary,cells=rows)
+    return dict(renderer=renderer,summary=summary,cells=rows,
+                criteria=dict(NATIVE_JOINT_CRITERIA, boundary_role='diagnostic_only', proxy_threshold='disabled_pending_TRAIN_calibration'))
 
 
 def validation_summary(report):
@@ -426,6 +459,12 @@ def validation_summary(report):
     exact = [case['exact']['summary'] for case in report['cases'] if 'exact' in case]
     summary['mean_exact_dice'] = (sum(item['cells']*item['mean_exact_dice'] for item in exact)
                                   /sum(item['cells'] for item in exact)) if exact else None
+    exact_cells = [cell for case in report['cases'] if 'exact' in case for cell in case['exact']['cells']]
+    exact_scores = [cell['exact_dice'] for cell in exact_cells]
+    summary.update(native_exact_cells=len(exact_cells),
+        minimum_exact_dice=min(exact_scores) if exact_scores else None,
+        native_dice_fail_cells=sum(score < .98 for score in exact_scores) if exact_scores else None,
+        all_native_dice_pass=all(score >= .98 for score in exact_scores) if exact_scores else None)
     reference_cells = [cell for case in report['cases'] if 'exact' in case
                        for cell in case['exact']['cells'] if cell['frame']==0]
     summary['reference_exact_dice'] = (float(np.mean([cell['exact_dice'] for cell in reference_cells]))
@@ -657,6 +696,10 @@ def main():
         while epoch<training['epochs']:
             epoch_start = time.perf_counter()
             stage = args.stage or stage_for_epoch(epoch,config)
+            if stage == 'joint':
+                joint_start = 0 if args.stage == 'joint' else training['shape_epochs']+training['motion_epochs']
+                progress = (epoch-joint_start)/max(1, training['epochs']-joint_start-1)
+                slicer.set_joint_progress(min(1., max(0., progress)))
             rate = learning_rate_for_epoch(epoch,config,stage)
             for group in optimizer.param_groups:
                 group['lr'] = rate
@@ -714,12 +757,21 @@ def main():
                     offset += batch_cases
                     step += 1
                     term_keys = list(losses['terms'])
+                    objective_keys = ('L_S', 'L_M', 'L_O')
                     loss_scalars = torch.stack([losses['total'].detach()]+
+                        [losses[key].detach() for key in objective_keys]+
                         [losses['terms'][key].detach() for key in term_keys]).cpu().tolist()
                     record = dict(epoch=epoch,step=step,sample_offset=offset,batch_cases=batch_cases,
                         stage=stage,total=loss_scalars[0],
-                        terms=dict(zip(term_keys,loss_scalars[1:])),
+                        objectives=dict(zip(objective_keys, loss_scalars[1:4])),
+                        objective_mode=losses['objective_mode'], objective_weights=losses['objective_weights'],
+                        terms=dict(zip(term_keys,loss_scalars[4:])),
                         active_weights=losses['active_weights'],units=losses['units'],seconds=time.perf_counter()-start)
+                    for source, target in (('motion_diagnostics', 'gt_motion'), ('observation_summary', 'observation')):
+                        summary = losses[source]
+                        if summary is not None:
+                            record[target] = {key: value.detach().cpu().tolist() if isinstance(value, torch.Tensor) else value
+                                              for key, value in summary.items()}
                     record['io_wait_seconds'] = io_wait
                     if torch.device(device).type=='cuda':
                         record['gpu_peak_allocated_bytes'] = torch.cuda.max_memory_allocated(device)
