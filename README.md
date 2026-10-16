@@ -1,19 +1,29 @@
-# HeartSSM
-Learning a dynamic four-chamber shape model of the human heart for 95,695 UK Biobank participants
+# NeuralFFDNet-based Sparse 2D Echocardiography to 4D Heart Mesh Reconstruction
 
-Geometry-aware Joint HeartFFDNet is implemented independently in
-[`net/geometry_heartffdnet.py`](net/geometry_heartffdnet.py), reusing the existing
-FFDNet spatial layers and three deformation heads. Known-pose physical lifting
-feeds all 24 phases into one shared 3D U-Net; one 72-channel head predicts the
-complete cycle before sequential physical FFD application. See the
-[implementation and acceptance report](GEOMETRY_HEARTFFD.rst) and
-[`configs/geometry_heartffd_1k.yaml`](configs/geometry_heartffd_1k.yaml).
-`train_geometry_heartffdnet.py` requires an explicit `--acceptance`, `--evaluate`
-or `--train` action; architecture acceptance does not launch full 1K training.
+The sole active reconstruction pipeline is **NeuralFFDNet, physical FFD,
+Native slice evaluation, TTO and geometry safety**. Three-view A2C/A3C/A4C
+Mask/SDF sequences produce Shape64 / Motion32 latents and fixed-topology
+four-chamber meshes over 24 phases. Progressive physical B-spline FFD applies
+Coarse → Medium → Fine reference deformations, followed by recurrent motion.
 
-Neural HeartFFDNet adds three-view 2D mask/SDF sequences, shape/motion latents,
-learned 3D features, physical multiscale FFD and four-chamber 4D supervision.
-The original volume-based pipeline remains available unchanged.
+G1/G2 Geometry-aware networks, Stage S/S2 networks and their dedicated training
+code/configurations were retired on 2026-10-16. Their committed source is
+recoverable from the local reference `backup/main-before-g1-cleanup-20261016`;
+historical results, checkpoints and experiment source snapshots remain in
+place. This cleanup does not change NeuralFFDNet inference or FFD mathematics.
+Shape solver design is a separate next step; no new architecture is introduced.
+
+The original CMR pipeline (`train_ffd.py`, `net/ffdnet.py`, `net/unet.py`,
+`heartssm_train.py`) remains for a separate cleanup and is outside the active
+sparse echocardiography pipeline. The original HeartSSM work is
+*Learning a dynamic four-chamber shape model of the human heart for 95,695 UK
+Biobank participants*.
+
+Use the project's existing Python environment for the commands below:
+
+```bash
+export PATH="/home/yilong/.conda/envs/4dheart/bin:$PATH"
+```
 
 ```bash
 python train_neural_ffd.py --config configs/neural_ffd.yaml
@@ -149,27 +159,44 @@ Per-step `slice_execution` and epoch `training_performance` record the backend.
 Network gradient checks and loss logging each transfer one batch summary.
 Use a larger cell chunk (e.g. 32) only after checking timing and GPU memory.
 
-`scripts/check_neural_ffd.py --benchmark-joint` compares the two executions on TRAIN,
-reports loss/vertex-gradient differences, CUDA-synchronized forward/backward
-times and peak allocated memory, and never updates the checkpoint or reads TEST:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -u scripts/check_neural_ffd.py --benchmark-joint \
-  --config configs/neural_ffd_1k_direct.yaml --checkpoint PATH/last.pth \
-  --device cuda:0 --cases 2 --repeats 3 --output outputs/archive/joint_benchmark.json
-```
+Historical benchmark evidence is retained in experiment outputs. The auxiliary
+benchmark runner was removed in an earlier cleanup.
 
 `outputs/` retains active experiments and `data_check/`. Historical baseline
 checkpoints/configs and consolidated engineering reports are in `outputs/archive/`.
 Completed one-step smoke checkpoint directories were removed after preserving
-summaries, gradient/timing evidence and test logs. Grouped-section regression
-tests are included in `tests/test_neural_ffd.py`; the parallel input/evaluation
-runtime remains a separate module because it owns process lifetimes and caches.
+summaries, gradient/timing evidence and test logs. The current test suite is
+`tests/test_real_tto.py`; older auxiliary test runners were retired separately.
+The parallel input/evaluation runtime owns process lifetimes and caches.
 
-See [implementation and validation](docs/neural_ffd.rst),
-[public-source review](docs/neural_ffd_sources.json), and
-[configuration](configs/neural_ffd.yaml). Architecture checks do not establish
-trained reconstruction accuracy; formal population training remains to be run.
+See the [configuration](configs/neural_ffd.yaml) and
+[project status and historical evidence](PROJECT_STATUS_HANDOFF.md).
+Existing full-cycle baseline results do not establish that all Shape/Motion
+accuracy and continuous safety requirements are met.
+
+## TTO and geometry safety
+
+The [TTO implementation](REAL_TTO_IMPLEMENTATION.md) uses the frozen
+NeuralFFDNet prior, Native observations, per-patient pose/Shape fitting and
+locked motion fields. `tto/geometry_guard.py` retains `SourceAVCapPolicy` from
+`utils/geometry_pair_policy.py`, actual mesh checks from
+`utils/geometry_v2_checks.py`, and the pinned bundle geometry kernels for
+discrete surfaces and continuous inter-frame checks. Missing backends remain
+`UNVERIFIED` and reject admission. No G1 control certificate is applied to
+NeuralFFDNet.
+
+Dependencies are recorded in [tto/requirements.txt](tto/requirements.txt).
+On this server, the existing isolated geometry packages can be enabled when
+running the tests:
+
+```bash
+PYTHONPATH=outputs/real_tto_motion_locked_20261016/_geometry_site \
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+python -m unittest discover -s tests -v
+```
+
+Tests and imports verify only their exercised contracts; they do not certify
+all meshes, patients, historical checkpoints or continuous neural deformations.
 
 ## Pose contract
 

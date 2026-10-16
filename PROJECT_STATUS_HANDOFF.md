@@ -1,5 +1,38 @@
 # HeartSSM 项目状态、研究证据与开发交接
 
+## 当前主线：2026-10-16 G1/G2 网络清理
+
+**本节记录最新仓库状态，优先于下文历史审计及后续补记中的“当前”“下一项”等表述。** 唯一保留的稀疏超声重建主线为 **NeuralFFDNet、物理 FFD、Native 切片、TTO 与几何安全**。保留 Shape64 / Motion32、渐进 Coarse→Medium→Fine 参考形变及递归运动；本轮没有新增网络、修改数学算法、启动训练或重跑研究队列。
+
+清理开始时分支为 `main`，HEAD 为 `5f5aca4e9ee4948ee35e41aa53ae73c32e5b54c2`，已跟踪及未跟踪工作区均干净。删除前建立本地历史引用 `backup/main-before-g1-cleanup-20261016`，指向同一提交；它仅用于恢复，未切换工作分支。
+
+- 按用户清单删除 10 个 G1/G2、Stage S/S2 及 latent 网络模块、3 个专属训练入口、5 个配置、5 个专属工具和5份历史文档，共28个已跟踪文件。
+- `utils/geometry_pair_policy.py` 仅移除底部4个 G1 包装函数，保留 `SourceAVCapPolicy`、`source_modules`、固定房室 cap 支持及检查算法。TTO 继续使用实际表面与连续周期审核，缺失后端仍为 `UNVERIFIED` 并拒绝准入。
+- `net/neural_ffdnet.py`、`net/multiview_encoder.py`、`train_neural_ffd.py`、物理 FFD、切片监督/评价、NeuralFFD Loss、验证运行时、`utils/geometry_v2_checks.py` 与 `tto/` 保持原样。历史输出、Checkpoint、数据和已有 `source/` 快照保留。
+- 原始 CMR 的 `train_ffd.py`、`net/ffdnet.py`、`net/unet.py`、`heartssm_train.py` 等不在本轮删除范围，留待单独清理。首页已更新为 *NeuralFFDNet-based Sparse 2D Echocardiography to 4D Heart Mesh Reconstruction*。
+
+### 本轮验证与环境区别
+
+1. `git grep` 检查 `net/ utils/ data/ tto/ train_neural_ffd.py` 无指定 G1 残留引用；另对全部 Git 跟踪的 Python、YAML、Shell 文件检查被删模块及包装函数，未发现执行引用。
+2. `python -m compileall -q net data utils tto train_neural_ffd.py` 通过；项目 Python 下也通过。NeuralFFDNet、MultiViewTemporalEncoder、`load_checkpoint`、物理 FFD、Native renderer、RealTTOPipeline 六个关键符号导入通过。
+3. 默认 `/opt/miniconda3/bin/python` 为 Python3.13，缺少 PyTorch，导入及 unittest 因 `ModuleNotFoundError: torch` 失败。这是解释器依赖问题，未修改源码规避。
+4. 使用 `/home/yilong/.conda/envs/4dheart/bin/python` 首次运行12项测试：11项通过，1项因固定几何后端缺失而跳过。随后使用已有的 `outputs/real_tto_motion_locked_20261016/_geometry_site`，12项全部通过，**零失败、零跳过**，含真实 Checkpoint 的 Shape 梯度/冻结权重/运动场重放、原生切片和几何拒绝及回滚合同。
+5. 逐字节核对32个保留源码文件（包含全部 `tto/`、`data/` 及上述核心/CMR入口），与备份提交一致；对 policy 模块比较 AST，确认唯一语义差异为删除指定4个包装函数。暂存区空白检查通过。
+
+最终测试命令：
+
+```bash
+PYTHONPATH=outputs/real_tto_motion_locked_20261016/_geometry_site \
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+/home/yilong/.conda/envs/4dheart/bin/python -m unittest discover -s tests -v
+```
+
+本轮检查不代表所有患者 Mesh、完整几何安全或历史 Checkpoint 恢复均通过。历史 G1/G2/S1/S2 的源码链接、结构图、训练建议和严格恢复说明仅用于追溯，不能作为当前主线的运行入口；复现时应使用原提交或实验源码快照。
+
+**下一步范围已由用户改为：围绕 NeuralFFDNet 的 Shape 问题，设计“二维边界精确贴合、未观测区域协调形变”的统一 FFD 求解器。** 本轮仅完成仓库瘦身，不实施第二步。下文第11节等旧 S1 局部编码/候选网络开发建议已退出当前计划；历史失败、科学限制及已有可行解证据仍须保留，不能据清理宣称精度改善或恢复新训练。
+
+## 历史审计与实验补记（以下为各自日期/版本的证据）
+
 审计日期：**2026-10-16，Asia/Shanghai**。工作区：`/mnt/nas1/disk07/yilong/HeartSSM`。本次为只读科研审计：没有训练、模型前向、Oracle、TTO、新几何认证、测试执行或算法修复；只读取源码/现有资产，安全读取三个 Checkpoint，核验选定哈希、统计已有指标，并新建本报告及审计证据目录。原先没有同名文件。
 
 > **一分钟结论：最终目标是从稀疏 A2C/A3C/A4C Mask/SDF、已声明的采集几何与周期时间，直接预测患者特异的固定拓扑四腔 24 帧 Mesh，兼顾逐切面精度、三维解剖、运动和连续几何。当前尚无通过全部要求的模型。旧网络有真实完整周期 VAL100 结果；新 Geometry-aware S1 完成 TRAIN800/32,000 更新，但参考 Shape 尾部仍不合格。当前优先修复 Shape，尤其 A4C/RA、RV；不能用平均 Dice、latent 重建或 Motion 补偿替代它。**
