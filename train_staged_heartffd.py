@@ -59,7 +59,7 @@ def code_identity():
     files = sorted(p for directory in ('net','utils','data') for p in (ROOT/directory).glob('*.py'))
     files += sorted(ROOT.glob('train*.py'))
     files += [ROOT/'configs/staged_heartffd.yaml',ROOT/'configs/geometry_heartffd_1k.yaml',
-              ROOT/'configs/synthetic_data_1k.yaml',ROOT/'tests/test_staged_heartffdnet.py',
+              ROOT/'configs/synthetic_data_1k.yaml',
               ROOT/'configs/staged_heartffd_train800.yaml',ROOT/'configs/staged_heartffd_refine.yaml']
     return {str(p.relative_to(ROOT)):_sha256(p) for p in files}
 

@@ -88,14 +88,39 @@ def validate_prediction(model, output, *, sample_jacobian=False, check_intersect
     if degenerates:
         raise ValueError('Degenerate output mesh triangles')
     controls = output['control_grids']
-    bounds = [control_lipschitz_bound(controls[k],model.control_spacings_mm[i])
-              for i,k in enumerate(('coarse','medium','fine'))]
+    certificate = getattr(model,'geometry_certificate','independent-global-columns-v1')
+    certificate_details = {}
+    if certificate == 'independent-global-columns-v1':
+        bounds = [control_lipschitz_bound(controls[k],model.control_spacings_mm[i])
+                  for i,k in enumerate(('coarse','medium','fine'))]
+    elif certificate == 'bernstein-frobenius-reference-v1':
+        # Explicit new-stage contract. The old estimator remains visible; the
+        # declared blended GLOBAL bound is audited independently in float64.
+        from utils.bernstein_certificate import bernstein_frobenius_bound
+        alpha = getattr(model.heads,'certificate_alpha',float('nan'))
+        if (not np.isfinite(alpha) or not 0<=alpha<=1 or model.heads.max_lipschitz != .45
+                or vertices.ndim!=4 or vertices.shape[1]!=1 or controls['fine'].shape[1]!=1):
+            raise ValueError('Bernstein certificate requires declared alpha,0.45 and Shape-only output')
+        old = [control_lipschitz_bound(controls[k].double(),model.control_spacings_mm[i].double())
+               for i,k in enumerate(('coarse','medium','fine'))]
+        bernstein = [bernstein_frobenius_bound(controls[k].double(),model.control_spacings_mm[i].double())
+                     for i,k in enumerate(('coarse','medium','fine'))]
+        bounds = [(1-alpha)*a+alpha*b for a,b in zip(old,bernstein)]
+        certificate_details = dict(certificate=certificate,certificate_alpha=alpha,
+            max_legacy_global_bound=max(float(x.max()) for x in old),
+            max_bernstein_bound=max(float(x.max()) for x in bernstein),
+            certificate_arithmetic='float64, original stored physical lattice')
+        if any(float(value.abs().max())>model.heads.reference_limit_mm+1e-5 for value in controls.values()):
+            raise ValueError('Bernstein reference displacement limit exceeded')
+    else:
+        raise ValueError('Unknown geometry certificate contract: '+str(certificate))
     maximum = max(float(bound.max()) for bound in bounds)
     if not np.isfinite(maximum) or maximum > model.heads.max_lipschitz+1e-5:
         raise ValueError('Spline injectivity certificate failed')
     result = dict(status='pass',degenerate_triangles=degenerates,min_twice_triangle_area_mm2=minimum_area,
         max_displacement_lipschitz_bound=maximum,
         self_intersection_policy='Within-chamber injectivity certificate composed from checked source template')
+    result.update(certificate_details)
     if check_intersections:
         crossings = 0
         for patient in range(len(vertices)):
