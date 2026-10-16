@@ -1,0 +1,16 @@
+# Validated Python3.11 stack. Install a CUDA-compatible PyTorch wheel separately
+# when needed; the audited host used torch2.1.2+cu118 / torchvision0.16.2+cu118.
+torch==2.1.2
+torchvision==0.16.2
+tqdm
+numpy==1.26.4
+scipy==1.17.1
+trimesh==4.11.5
+pydicom==3.0.2
+PyYAML==6.0.3
+matplotlib==3.10.8
+vtk==9.6.2
+opencv-python-headless==4.10.0.84
+# These exact native geometry versions are enforced by the original backend.
+cgal==6.0.1.post202410241521
+ipctk==1.6.0

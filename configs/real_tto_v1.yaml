@@ -1,0 +1,87 @@
+version: real-tto-v1
+prior:
+  checkpoint: outputs/neural_ffd_1k_long_20261010_225918/best_joint.pth
+  sha256: 8c01b3bccb1d3bb70547b2fd6c844fd06542632533261576177b5bcacaaa570f
+  shape_dim: 64
+  motion_dim: 32
+  calibration: configs/real_tto_prior_calibration.json
+data:
+  root: real_data
+  frames: 24
+  model_size: 224
+  sdf_clip_mm: 15.0
+  canonical_fov_mm: {A2C: 231.902, A3C: 226.07, A4C: 209.037}
+  load_images: true
+  source_weights:
+    manual_ed_es: 1.0
+    manual_review: 1.0
+    patient_adapted_model: 0.25
+    temporal_fallback: 0.1
+    not_applicable: 0.0
+loss:
+  sigma_mm: 1.0
+  boundary_band_mm: 1.5
+  boundary_weight: 0.25
+  dice_smooth: 1.0
+  gce_q: 0.7
+  gce_weight: 0.1
+  sdf_scale_mm: 3.0
+  sdf_band_mm: 12.0
+  sdf_weight: 0.08
+  tail_cells: 2
+  tail_weight: 0.25
+  capture_distance_weight: 0.02
+  capture_centroid_weight: 0.1
+pose:
+  starts: 8
+  start_translation_mm: 4.0
+  start_rotation_degrees: 6.0
+  translation_limit_mm: 15.0
+  rotation_limit_degrees: 20.0
+  translation_prior: 0.0001
+  rotation_prior: 0.00002
+  relative_prior: 0.0002
+  levels:
+    - {stride: 8, updates: 20, lr: 0.3}
+    - {stride: 4, updates: 40, lr: 0.2}
+shape:
+  updates: 100
+  lr: 0.01
+  stride: 4
+  rms_limit: 0.5
+  coordinate_limit: 2.0
+  observed_band_mm: 5.0
+  unknown_max_mm: 2.0
+  all_vertex_max_mm: 8.0
+  latent_weight: 0.02
+  unknown_weight: 0.02
+  all_vertex_weight: 0.002
+# Frozen TRAIN16 pilot limits, copied verbatim; never recalibrated on real cases.
+motion_limits:
+  relative_motion_rmse_mm: 0.3934903961420059
+  amplitude_log_ratio: 0.016520890144789482
+  direction_one_minus_cosine: 0.0058724935054779055
+  velocity_error_rms_mm_per_cycle: 2.12906315946579
+  acceleration_error_rms_mm_per_cycle2: 48.07202522277832
+  normalized_jerk_log_ratio: 0.02168520698045669
+  closing_step_error_mm: 0.2244799241423607
+  volume_swing_log_ratio: 0.06993739071924816
+  volume_peak_shift_cycles: 0.08333333333333333
+  volume_trough_shift_cycles: 0.041666666666666664
+joint:
+  updates: 30
+  shape_lr: 0.002
+  pose_lr: 0.03
+  stride: 4
+  translation_limit_mm: 2.0
+  rotation_limit_degrees: 2.0
+  pose_prior: 0.002
+runtime:
+  device: cuda:4
+  batch_size: 2
+  seed: 2026
+  threads: 4
+output:
+  root: outputs/real_tto_v1
+  export_ply: true
+  visualizations: true
