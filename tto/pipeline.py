@@ -21,6 +21,12 @@ STAGES = ('initial', 'pose', 'shape', 'motion_lock', 'joint', 'evaluate', 'expor
 
 
 class RealTTOPipeline:
+    def __new__(cls, config):
+        if config.get('version') == 'real-tto-joint-v1':
+            from .joint_pipeline import RealTTOPipeline as JointPipeline
+            return JointPipeline(config)
+        return super().__new__(cls)
+
     def __init__(self, config):
         self.config = config
         self.output = resolve(config['output']['root'])

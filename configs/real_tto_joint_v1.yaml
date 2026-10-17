@@ -1,0 +1,111 @@
+version: real-tto-joint-v1
+prior:
+  checkpoint: outputs/neural_ffd_1k_long_20261010_225918/best_joint.pth
+  sha256: 8c01b3bccb1d3bb70547b2fd6c844fd06542632533261576177b5bcacaaa570f
+  shape_dim: 64
+  motion_dim: 32
+  calibration: configs/real_tto_prior_calibration.json
+data:
+  root: real_data
+  frames: 24
+  model_size: 224
+  sdf_clip_mm: 15.0
+  canonical_fov_mm: {A2C: 231.902, A3C: 226.07, A4C: 209.037}
+  load_images: true
+  source_weights: {manual_ed_es: 1.0, manual_review: 1.0, synthetic_observed: 1.0, patient_adapted_model: 0.25, temporal_fallback: 0.1, not_applicable: 0.0}
+supervision:
+  max_nearest_time_error_ms: 25.0
+  unverified_phase_confidence: 0.25
+  trusted_confidence_threshold: 0.5
+loss:
+  # Exact checkpoint config.yaml slice weights; real binary targets, no GT mesh.
+  sigma_mm: 1.0
+  pixel_stride: 4
+  chunk_size: 256
+  cell_chunk_size: 8
+  dice_weight: 1.0
+  bce_weight: 0.1
+  boundary_weight: 0.1
+  target_mode: binary_native_v1
+  capture_prior_weight: 0.02
+  capture_centroid_weight: 0.1
+pose:
+  starts: 8
+  start_translation_mm: 4.0
+  start_rotation_degrees: 6.0
+  translation_limit_mm: 15.0
+  rotation_limit_degrees: 20.0
+  translation_prior: 0.0001
+  rotation_prior: 0.00002
+  relative_prior: 0.0002
+  levels:
+    - {stride: 8, updates: 20, lr: 0.3}
+    - {stride: 4, updates: 40, lr: 0.2}
+joint:
+  # Pilot budget, NOT an approved full-cohort protocol until oracle validation.
+  updates: 20
+  shape_lr: 0.005
+  pose_lr: 0.05
+  translation_limit_mm: 15.0
+  rotation_limit_degrees: 20.0
+  rms_limit: 0.5
+  coordinate_limit: 2.0
+  observed_band_mm: 5.0
+  unknown_max_mm: 2.0
+  all_vertex_max_mm: 8.0
+  tail_max_drop: 0.02
+  rejection_lr_backoff: 0.5
+  minimum_lr_factor: 0.001
+  regularization:
+    latent_initial_prior: 0.02
+    latent_train_distribution_prior: 0.001
+    unobserved_structure_prior: 0.02
+    reference_drift_prior: 0.002
+    ffd_control_prior: 0.001
+    translation_prior: 0.0001
+    rotation_prior: 0.00002
+    relative_view_prior: 0.0002
+    motion_preservation_prior: 0.01
+motion_limits:
+  # Unchanged, predeclared TRAIN-only limits from the audited legacy protocol.
+  relative_motion_rmse_mm: 0.3934903961420059
+  amplitude_log_ratio: 0.016520890144789482
+  direction_one_minus_cosine: 0.0058724935054779055
+  velocity_error_rms_mm_per_cycle: 2.12906315946579
+  acceleration_error_rms_mm_per_cycle2: 48.07202522277832
+  normalized_jerk_log_ratio: 0.02168520698045669
+  closing_step_error_mm: 0.2244799241423607
+  volume_swing_log_ratio: 0.06993739071924816
+  volume_peak_shift_cycles: 0.08333333333333333
+  volume_trough_shift_cycles: 0.041666666666666664
+synthetic:
+  data_config: configs/synthetic_data_1k.yaml
+  cases: 16
+  exclude_calibration_cases: true
+  selection: first TRAIN manifest members not used by calibration
+  gate_before_real: true
+  validation_gate: null
+  gate:
+    minimum_cases: 16
+    minimum_admitted_fraction: 0.75
+    median_rotation_degrees: 10.0
+    median_translation_mm: 10.0
+    median_shape_rmse_mm: 10.0
+    shape_rmse_growth_mm: 0.5
+runtime:
+  device: auto
+  batch_size: 1
+  seed: 2026
+  threads: 4
+  gpu_margin_fraction: 0.35
+  gpu_retries: 0
+  gpu_retry_seconds: 30
+output:
+  root: outputs/real_tto_joint_v1_20261016
+  export_ply: true
+  visualizations: true
+experiment:
+  arm: joint
+  initialization_source: null
+  arms: [frozen_prior, pose_only, shape_only, alternate, joint, original_motion, ed_only]
+  cohort: [C01, C02, C03, C04, C05, C06, C07, C08, C09, C10, C11, C13, C14, C15, C16, C17, C20]

@@ -83,3 +83,30 @@ class GeometryGuard:
                 passed=bool(cross_pass), records=cross), continuous=temporal,
             spatial_ffd_certificate=dict(status='UNVERIFIED', reason='No compatible whole-field certificate for original NeuralFFDNet'),
             topology='unchanged source chamber faces and vertex identities')
+
+
+class TTOGeometryGuard(GeometryGuard):
+    """Cache identical complete audits; geometry kernels/rules stay unchanged."""
+    def __init__(self, model, cache_size=8):
+        from collections import OrderedDict
+        super().__init__(model)
+        self._audit_cache = OrderedDict()
+        self.cache_size = cache_size
+        self.cache_hits = 0
+
+    def audit(self, trajectory, *, continuous=True):
+        import hashlib
+        from copy import deepcopy
+        value = np.ascontiguousarray(trajectory, dtype=np.float64)
+        key = (value.shape, hashlib.sha256(value.tobytes()).hexdigest(), continuous)
+        if key in self._audit_cache:
+            self.cache_hits += 1
+            self._audit_cache.move_to_end(key)
+            return deepcopy(self._audit_cache[key])
+        report = super().audit(value, continuous=continuous)
+        # An unavailable computation is retried, rather than cached as a verdict.
+        if all(report[scope]['status'] != 'UNVERIFIED'
+               for scope in ('shape', 'saved_phases', 'inter_chamber', 'continuous')):
+            self._audit_cache[key] = deepcopy(report)
+            while len(self._audit_cache) > self.cache_size:self._audit_cache.popitem(last=False)
+        return report

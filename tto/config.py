@@ -13,9 +13,12 @@ def resolve(path):
 
 def load_config(path):
     config = yaml.safe_load(Path(path).read_text())
-    if config.get('version') != 'real-tto-v1':
-        raise ValueError('Expected version: real-tto-v1')
-    for key in ('prior', 'data', 'loss', 'pose', 'shape', 'motion_limits', 'joint', 'runtime', 'output'):
+    version = config.get('version')
+    if version not in ('real-tto-v1', 'real-tto-joint-v1'):
+        raise ValueError('Expected version: real-tto-v1 or real-tto-joint-v1')
+    required = ('prior', 'data', 'loss', 'pose', 'motion_limits', 'joint', 'runtime', 'output')
+    required += ('shape',) if version == 'real-tto-v1' else ('supervision', 'synthetic', 'experiment')
+    for key in required:
         if key not in config:
             raise ValueError(f'Missing config section {key}')
     if config['prior'].get('shape_dim') != 64 or config['prior'].get('motion_dim') != 32:

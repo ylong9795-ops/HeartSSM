@@ -99,6 +99,7 @@ class RealTTODataset(Dataset):
         if len(cycles) != 1:
             raise ValueError('Manual ED must belong to one fully covered reported RR')
         start, end = cycles[0]
+        es_time = es*dt+delay
         regions = {r['plane']: r for r in calibration['regions']}
         views = []
         for vi, (name, plane) in enumerate(zip(FOLDERS, PLANE_IDS)):
@@ -125,6 +126,9 @@ class RealTTODataset(Dataset):
             cycle_duration_s=end-start, anchor_time_s=anchor, ED_frame=ed, ES_frame=es,
             dicom=str(paths[0]), dicom_sha256=sha256(paths[0]), views=views,
             acquisition_status='display-time synchronized; absolute 3D calibration unverified',
+            manual_phase_alignment=dict(ED_time_s=anchor, ES_time_s=es_time,
+                ES_inside_selected_RR=bool(start<=es_time<end),
+                source_frame0_equals_real_ED='UNVERIFIED; source reference phase is not universally ventricular ED'),
             image_layout='DICOM display region crop')
 
     def __getitem__(self, index):
@@ -243,6 +247,10 @@ class RealTTODataset(Dataset):
                         raise ValueError('Original images and masks must share native grid/time')
                     images.append(raw[[mapping[t][vi]['nearest_index'] for t in range(24)]].copy())
         metadata = dict(contract=contract, source_hashes=source_hashes, mapping=mapping,
+            raw_temporal_coverage=[dict(view=VIEWS[vi], original_frames=len(view['times']),
+                frames_inside_selected_RR=int(((view['times']>=start)&(view['times']<start+duration)).sum()),
+                excluded_frame_reason='Outside the preselected complete RR; independent of prediction/Dice')
+                for vi,view in enumerate(views)],
             model_to_native=np.stack(transforms, 1).tolist(), model_spacing_yx_mm=np.stack(pixel_spacing, 1).tolist(),
             model_grid='per-view physical centre W/2,H/2; fixed FOV; no cross-view padding',
             native_evaluation='nearest original binary observation; timing error retained',
