@@ -194,6 +194,11 @@ class ObservationFFDRefiner(nn.Module):
         self.hidden_channels, self.max_control_norm_mm = hidden_channels, float(max_control_norm_mm)
         self.temporal_node_chunk_size, self.spatial_frame_chunk_size = temporal_node_chunk_size, spatial_frame_chunk_size
         self.displacement_scale_mm, self.support_scale_mm = float(displacement_scale_mm), float(support_scale_mm)
+        self.configuration = dict(input_channels=input_channels, hidden_channels=hidden_channels,
+            shape_dim=shape_dim, motion_dim=motion_dim, max_control_norm_mm=max_control_norm_mm,
+            spatial_blocks=spatial_blocks, temporal_node_chunk_size=temporal_node_chunk_size,
+            spatial_frame_chunk_size=spatial_frame_chunk_size, displacement_scale_mm=displacement_scale_mm,
+            support_scale_mm=support_scale_mm)
         self.chamber_stem = nn.Conv3d(16, hidden_channels, 1, groups=4, bias=False)
         self.fusion = nn.Conv3d(hidden_channels, hidden_channels, 1, bias=False)
         self.spatial = nn.Sequential(*[_SpatialBlock(hidden_channels) for _ in range(spatial_blocks)])
@@ -304,11 +309,19 @@ class JointFFDRefiner(nn.Module):
             cell_chunk_size=observation_cell_chunk_size)
         self.max_observation_distance_mm = max_observation_distance_mm
         self.splat_point_chunk_size, self.ffd_frame_chunk_size = splat_point_chunk_size, ffd_frame_chunk_size
+        self.configuration = dict(max_observation_distance_mm=max_observation_distance_mm,
+            boundary_sample_step_mm=boundary_sample_step_mm, splat_point_chunk_size=splat_point_chunk_size,
+            ffd_frame_chunk_size=ffd_frame_chunk_size, observation_cell_chunk_size=observation_cell_chunk_size)
         self.refiner.to(base_model.control_origins_mm)
 
     def forward(self, observations, *, pose):
         with torch.profiler.record_function('refiner/base_forward'):
             base = self.base_model(observations)
+        splat = self.observation_features(base, observations, pose=pose)
+        return self.refine_base(base, splat, phases=observations['phases'])
+
+    def observation_features(self, base, observations, *, pose):
+        """Explicit physical input stage; cache only while Base is frozen/eval."""
         vertices = base['vertices_4d']
         shape = self.base_model.grid_shapes[2]
         origin, spacing = self.base_model.control_origins_mm[2], self.base_model.control_spacings_mm[2]
@@ -324,8 +337,14 @@ class JointFFDRefiner(nn.Module):
             splat = splat_observation_residuals(residuals, origin, spacing, shape,
                 batch_size=vertices.shape[0], frames=vertices.shape[1], recovery=recovery,
                 max_displacement_mm=self.max_observation_distance_mm, point_chunk_size=self.splat_point_chunk_size)
+        return splat
+
+    def refine_base(self, base, splat, *, phases):
+        """Same shared prediction/application path for cached or online inputs."""
+        vertices = base['vertices_4d']
+        origin, spacing = self.base_model.control_origins_mm[2], self.base_model.control_spacings_mm[2]
         with torch.profiler.record_function('refiner/shared_network'):
-            refinement = self.refiner(splat['features'], base['z_shape'], base['z_motion'], phases=observations['phases'])
+            refinement = self.refiner(splat['features'], base['z_shape'], base['z_motion'], phases=phases)
         with torch.profiler.record_function('refiner/residual_ffd'):
             final = apply_residual_ffd(vertices, refinement['controls_res_mm'], origin, spacing,
                                        frame_chunk_size=self.ffd_frame_chunk_size)

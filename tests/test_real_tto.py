@@ -47,7 +47,7 @@ class RealTTOTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         fixture(self.root, 'new_patient');fixture(self.root, 'other_patient', 2)
         self.config = load_config(ROOT/'configs/tto.yaml')['data']
-        self.config.update(model_size=32, canonical_fov_mm={v:60. for v in VIEWS})
+        self.config.update(input_mode='raw_rr', model_size=32, canonical_fov_mm={v:60. for v in VIEWS})
         self.config['load_images'] = True
 
     def tearDown(self):

@@ -154,6 +154,11 @@ def save_checkpoint(path,model,optimizer,*,config,identity,epoch=0,sample_offset
 def load_checkpoint(path,device='cpu'):
     """Construct a self-contained decoder; validate every fixed geometry buffer."""
     saved = torch.load(path,map_location='cpu',weights_only=True)
+    return model_from_checkpoint(saved,device),saved
+
+
+def model_from_checkpoint(saved,device='cpu'):
+    """Rebuild the original model from an embedded, validated checkpoint."""
     if saved['version']!=CHECKPOINT_VERSION or saved['architecture']!=ARCHITECTURE:
         raise ValueError('Unsupported Neural HeartFFDNet checkpoint')
     state,spec = saved['model'],saved['specification']
@@ -175,7 +180,7 @@ def load_checkpoint(path,device='cpu'):
             raise ValueError('Checkpoint fixed control/topology buffer differs: '+key)
     model.load_state_dict(state,strict=True)
     model.initialization_metadata = saved.get('initialization')
-    return model.to(device),saved
+    return model.to(device)
 
 
 def initialize_from_checkpoint(model,path,identity):

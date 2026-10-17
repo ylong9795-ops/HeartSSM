@@ -135,7 +135,17 @@ class RealTTODataset(Dataset):
         patient = self.patients[index]
         folder = self.root / patient
         manifest = folder / 'tto_input.json'
+        mode = self.config.get('input_mode')
+        if mode == 'aligned24':
+            from .aligned24 import load_aligned24
+            return load_aligned24(folder, self.config)
+        if mode != 'raw_rr':
+            raise ValueError('Explicit input_mode=aligned24 or raw_rr required; no implicit RR resampling')
+        if (folder / 'metadata.json').exists() and not manifest.exists():
+            raise ValueError('Packaged observations require aligned24; raw RR fallback is forbidden')
         contract = read_json(manifest) if manifest.exists() else self._repository_contract(folder)
+        if contract.get('input_mode', 'raw_rr') != 'raw_rr':
+            raise ValueError('aligned24 observations must never enter the raw RR path')
         if contract.get('version') != 'real-tto-input-v1' or contract['patient_id'] != patient:
             raise ValueError('Input version/patient identity mismatch')
         if [v['name'] for v in contract['views']] != list(VIEWS):

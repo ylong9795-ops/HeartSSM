@@ -36,7 +36,7 @@ class ScaffoldTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         fixture(self.root, 'patient')
         self.config = load_config('configs/tto.yaml')
-        self.config['data'].update(root=str(self.root), model_size=32,
+        self.config['data'].update(root=str(self.root), input_mode='raw_rr', model_size=32,
             canonical_fov_mm={v: 60. for v in ('A2C', 'A3C', 'A4C')})
         self.config['output']['root'] = str(self.root / 'result')
         self.config['runtime']['threads'] = 2

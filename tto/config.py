@@ -40,7 +40,11 @@ def validate_config(config):
     if not isinstance(checksum, str) or len(checksum) != 64 or any(c not in '0123456789abcdef' for c in checksum):
         raise ValueError('Pinned lowercase checkpoint SHA256 required')
     data = config['data']
-    _keys(data, ('root', 'frames', 'model_size', 'sdf_clip_mm', 'canonical_fov_mm', 'load_images', 'source_weights'), 'data')
+    _keys(data, ('root', 'input_mode', 'frames', 'model_size', 'sdf_clip_mm', 'canonical_fov_mm', 'load_images', 'source_weights'), 'data')
+    if data['input_mode'] not in ('aligned24', 'raw_rr'):
+        raise ValueError('data.input_mode must explicitly select aligned24 or raw_rr')
+    if data['input_mode'] == 'aligned24' and data['model_size'] != 224:
+        raise ValueError('aligned24 requires the pretrained 224 x 224 grid')
     if data['frames'] != 24:
         raise ValueError('Exactly 24 model phases required')
     _number(data['model_size'], 'model_size', positive=True, integer=True)

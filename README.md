@@ -299,7 +299,9 @@ The output retains the base `control_grids` for existing loss interfaces;
 refinement controls live separately under `refinement`. Physical spatial
 gradient, cyclic velocity and cyclic acceleration penalties are returned under
 `control_regularization` for explicit weighting by a training objective.
-The training CLI has not been switched to this architecture. A 3 mm control
+The original training CLI remains a Base-model entry. The separate
+`train_joint_refiner.py` entry below trains and reloads the shared composition.
+A 3 mm control
 bound or small penalties do not certify positive Jacobians or mesh quality;
 Native Exact, GT Shape/Motion and complete composed-mesh geometry acceptance
 remain necessary before judging a trained model.
@@ -388,6 +390,69 @@ mean including warmup, potentially including other processes). Its paired
 four-case loss difference was 2.38e-7 and gradient difference relative to the
 global gradient peak was 1.03e-5. This larger-batch result is an engineering
 throughput test, not evidence of identical convergence to batch 1.
+
+## Start a shared Refiner Joint from an existing epoch
+
+`train_joint_refiner.py` starts a **new experiment** from an existing original
+`best_joint.pth`; it does not resume the old Adam or modify its run directory.
+The first-stage scope is explicit: Base stays frozen/eval and all patients
+share one trainable Refiner. No patient-specific controls are optimized.
+The original GT Shape/Motion, mesh edge/normal/Laplacian and paired physical
+boundary objective supervise the final mesh. Residual spatial gradients,
+cyclic velocity and acceleration are additionally included in the total loss.
+
+```bash
+CUDA_VISIBLE_DEVICES=7 /home/yilong/.conda/envs/4dheart/bin/python -u train_joint_refiner.py \
+  --initialize PATH_TO_ORIGINAL_BEST_JOINT.pth \
+  --output outputs/NEW_REFINER_EXPERIMENT \
+  --device cuda:0 --train-cases 16 --val-cases 8 --steps 200 --batch-size 4
+```
+
+The source checkpoint supplies the original configuration, geometry and data
+identity. Fixed first TRAIN/VAL manifest members, source hashes, inherited
+epoch/update count, new update budget and regularization are saved before
+learning. The fixed endpoint is compared with its frozen Base; validation
+does not tune the learning rate, stopping time or checkpoint selection. TEST
+is not read. This is a bounded learning diagnostic, not cohort acceptance.
+
+Frozen Base predictions and physical observation features are cached once;
+the shared Refiner, original physical FFD and active supervised objective run
+on every update. Cached and online inference use the same methods. Caching
+must not be reused if Base is later unfrozen or observations/Pose change.
+
+`last.pth` embeds the full Base, Refiner configuration/weights, new Adam, RNG
+and sampler state. `--resume PATH --output RUN_DIRECTORY` restores the saved
+experiment settings and remaining updates. `--evaluate PATH --output NEW_DIR`
+reloads the trained model and repeats its fixed TRAIN/VAL comparison. These
+checkpoints load with `utils.joint_refiner_training.load_refiner_checkpoint`,
+not the original Base-only loader; inference still requires explicit Pose.
+
+Reports include original Native Exact cells (GT re-render verified), GT
+Shape/Motion, each chamber and right-heart minimum/P1/P5/Dice-failure counts,
+and worst identities. Sampled Jacobians replay the actual complete Base plus
+residual FFD composition. Full selected-case geometry audits reuse the pinned
+source AV-cap policy, CGAL and IPC for saved surfaces and all linear vertex
+chords including phase23->0. Sampled Jacobians and chord checks do not certify
+the whole spatial field or arbitrary continuous neural trajectories. Missing
+geometry backends remain UNVERIFIED. The existing isolated native packages
+can be exposed through:
+
+```bash
+export PYTHONPATH=outputs/audit_result/real_tto_motion_locked_20261016/_geometry_site
+```
+
+`protocol.json`, `history.jsonl`, `reload_verification.json`,
+`train_comparison.json`, `val_comparison.json`, `*_native_cells.json`,
+`geometry.json` and `decision.json` retain the experiment evidence. Geometry
+failures are reported even when Dice improves; no failed cases are discarded.
+
+The first fixed TRAIN16/VAL8 experiment initialized epoch75/step60000 and
+completed 200 shared Refiner updates with Base tensors unchanged. VAL Native
+Dice improved from 0.9756 to 0.9829; cells below0.98 fell from907 to394 and
+right-heart failures from339 to186. All24 selected cases passed saved-mesh
+and inter-frame chord audits. The minimum VAL Dice remained0.9388 and no VAL
+case passed every cell, so this is improvement evidence, not tail acceptance.
+See [the complete bounded report](outputs/joint_refiner_train16_val8_20261017_v2/final_report.rst).
 
 ## TTO and geometry safety
 

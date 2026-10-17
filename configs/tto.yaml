@@ -5,7 +5,8 @@ prior:
   shape_dim: 64
   motion_dim: 32
 data:
-  root: real_data
+  root: outputs/patient_24frames_masks_reports_20261017
+  input_mode: aligned24
   frames: 24
   model_size: 224
   sdf_clip_mm: 15.0
