@@ -1,9 +1,12 @@
-"""Versioned configuration. Relative paths always resolve from repository root."""
+"""One strict scaffold configuration. Paths resolve from repository root."""
 from copy import deepcopy
 from pathlib import Path
-import yaml
+import math
 
+import yaml
 from .io import ROOT
+
+VERSION = 'tto-scaffold-v1'
 
 
 def resolve(path):
@@ -11,20 +14,77 @@ def resolve(path):
     return path if path.is_absolute() else ROOT / path
 
 
-def load_config(path):
-    config = yaml.safe_load(Path(path).read_text())
-    version = config.get('version')
-    if version not in ('real-tto-v1', 'real-tto-joint-v1'):
-        raise ValueError('Expected version: real-tto-v1 or real-tto-joint-v1')
-    required = ('prior', 'data', 'loss', 'pose', 'motion_limits', 'joint', 'runtime', 'output')
-    required += ('shape',) if version == 'real-tto-v1' else ('supervision', 'synthetic', 'experiment')
-    for key in required:
-        if key not in config:
-            raise ValueError(f'Missing config section {key}')
-    if config['prior'].get('shape_dim') != 64 or config['prior'].get('motion_dim') != 32:
-        raise ValueError('This protocol requires original 64D Shape / 32D Motion')
-    if config['data'].get('frames') != 24:
-        raise ValueError('This protocol requires 24 phases')
-    if config['runtime']['batch_size'] < 1:
-        raise ValueError('Positive batch_size required')
+def _keys(value, expected, section):
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise ValueError(f'{section} requires exactly: {", ".join(expected)}')
+
+
+def _number(value, name, *, positive=False, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f'{name} must be finite numeric')
+    if (integer and not isinstance(value, int)) or value < 0 or (positive and value <= 0):
+        raise ValueError(f'Invalid {name}: {value}')
+
+
+def validate_config(config):
+    if not isinstance(config, dict) or config.get('version') != VERSION:
+        raise ValueError(f'Expected {VERSION}; legacy TTO protocols are retired')
+    _keys(config, ('version', 'prior', 'data', 'supervision', 'loss', 'alignment', 'runtime', 'output'), 'config')
+    prior = config['prior']
+    _keys(prior, ('checkpoint', 'sha256', 'shape_dim', 'motion_dim'), 'prior')
+    if prior['shape_dim'] != 64 or prior['motion_dim'] != 32:
+        raise ValueError('Original Shape64 / Motion32 required')
+    if not isinstance(prior['checkpoint'], str) or not prior['checkpoint']:
+        raise ValueError('Explicit pretrained checkpoint required')
+    checksum = prior['sha256']
+    if not isinstance(checksum, str) or len(checksum) != 64 or any(c not in '0123456789abcdef' for c in checksum):
+        raise ValueError('Pinned lowercase checkpoint SHA256 required')
+    data = config['data']
+    _keys(data, ('root', 'frames', 'model_size', 'sdf_clip_mm', 'canonical_fov_mm', 'load_images', 'source_weights'), 'data')
+    if data['frames'] != 24:
+        raise ValueError('Exactly 24 model phases required')
+    _number(data['model_size'], 'model_size', positive=True, integer=True)
+    _number(data['sdf_clip_mm'], 'sdf_clip_mm', positive=True)
+    _keys(data['canonical_fov_mm'], ('A2C', 'A3C', 'A4C'), 'canonical_fov_mm')
+    for value in data['canonical_fov_mm'].values():
+        _number(value, 'canonical_fov_mm', positive=True)
+    if not isinstance(data['root'], str) or not data['root'] or not isinstance(data['load_images'], bool):
+        raise ValueError('data.root and boolean load_images required')
+    if not isinstance(data['source_weights'], dict) or not data['source_weights']:
+        raise ValueError('Explicit annotation source trust weights required')
+    for value in data['source_weights'].values():
+        _number(value, 'source_weight')
+        if value > 1:
+            raise ValueError('Source weights must be in [0,1]')
+    policy = config['supervision']
+    _keys(policy, ('max_nearest_time_error_ms', 'unverified_phase_confidence', 'trusted_confidence_threshold'), 'supervision')
+    for name, value in policy.items():
+        _number(value, name)
+        if name != 'max_nearest_time_error_ms' and value > 1:
+            raise ValueError(f'{name} must be in [0,1]')
+    loss = config['loss']
+    _keys(loss, ('sigma_mm', 'pixel_stride', 'chunk_size', 'cell_chunk_size', 'dice_weight', 'bce_weight', 'boundary_weight', 'target_mode'), 'loss')
+    if loss['target_mode'] != 'binary_native_v1':
+        raise ValueError('Only native binary 2D supervision is supported')
+    for name in ('sigma_mm', 'pixel_stride', 'chunk_size', 'cell_chunk_size'):
+        _number(loss[name], name, positive=True, integer=name != 'sigma_mm')
+    for name in ('dice_weight', 'bce_weight', 'boundary_weight'):
+        _number(loss[name], name)
+    if sum(loss[name] for name in ('dice_weight', 'bce_weight', 'boundary_weight')) <= 0:
+        raise ValueError('At least one 2D loss component must be active')
+    _keys(config['alignment'], ('chamber_mode',), 'alignment')
+    if config['alignment']['chamber_mode'] != 'initial_candidates_only':
+        raise ValueError('Chamber translations may only generate initial candidates')
+    _keys(config['runtime'], ('device', 'threads', 'seed'), 'runtime')
+    if config['runtime']['device'] != 'cpu':
+        raise ValueError('Scaffold initialization supports cpu; GPU workload admission is not wired yet')
+    _number(config['runtime']['threads'], 'threads', positive=True, integer=True)
+    _number(config['runtime']['seed'], 'seed', integer=True)
+    _keys(config['output'], ('root',), 'output')
+    if not isinstance(config['output']['root'], str) or not config['output']['root']:
+        raise ValueError('Output root required')
     return deepcopy(config)
+
+
+def load_config(path):
+    return validate_config(yaml.safe_load(resolve(path).read_text()))

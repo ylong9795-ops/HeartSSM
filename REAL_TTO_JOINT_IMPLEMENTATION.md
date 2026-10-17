@@ -1,3 +1,6 @@
+> Historical protocol (retired 2026-10-17). Commands and acceptance rules below
+> describe the old implementation. Current entry and contracts: [tto/README.md](tto/README.md).
+
 # 全周期 Shape–Pose Joint TTO
 
 新协议为 `real-tto-joint-v1`。旧 `real-tto-v1` 的参考帧 Shape-only 和末端小范围 Joint 保留为历史基线。进程 3729062 已按用户要求终止，不会由新入口恢复。

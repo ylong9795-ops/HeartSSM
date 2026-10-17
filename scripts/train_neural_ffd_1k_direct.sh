@@ -5,6 +5,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 HEARTFFD_PYTHON="${HEARTFFD_PYTHON:-/home/yilong/.conda/envs/4dheart/bin/python}"
 TRAIN_PROFILE="${TRAIN_PROFILE:-diagnostic}"
+MEMORY_PROFILE="${MEMORY_PROFILE:-throughput}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"
 case "$TRAIN_PROFILE" in
   diagnostic|long) ;;
@@ -22,6 +23,12 @@ fi
 TRAIN_CONFIG="configs/neural_ffd_1k_direct.yaml"
 VAL_CASES=32
 RESUME_ARGS=()
+EXECUTION_ARGS=(--memory-profile "$MEMORY_PROFILE")
+if [[ -n "${CNN_CHUNK_SIZE:-}" ]]; then EXECUTION_ARGS+=(--cnn-chunk-size "$CNN_CHUNK_SIZE"); fi
+if [[ -n "${SLICE_CELL_CHUNK:-}" ]]; then EXECUTION_ARGS+=(--slice-cell-chunk "$SLICE_CELL_CHUNK"); fi
+if [[ -n "${SLICE_QUERY_CHUNK:-}" ]]; then EXECUTION_ARGS+=(--slice-query-chunk "$SLICE_QUERY_CHUNK"); fi
+if [[ -n "${BATCH_SIZE:-}" ]]; then EXECUTION_ARGS+=(--batch-size "$BATCH_SIZE"); fi
+if [[ -n "${PROFILE_STEPS:-}" ]]; then EXECUTION_ARGS+=(--profile-steps "$PROFILE_STEPS"); fi
 if [[ -n "$RESUME_CHECKPOINT" ]]; then
   TRAIN_CONFIG="$RUN_OUTPUT/config.yaml"
   if [[ ! -f "$TRAIN_CONFIG" || ! -f "$RESUME_CHECKPOINT" ]]; then
@@ -53,7 +60,7 @@ echo "Training profile=$TRAIN_PROFILE | physical GPU=$CUDA_VISIBLE_DEVICES | out
   --device cuda:0 --exact \
   --train-workers 4 --train-prefetch 2 \
   --eval-workers 4 --eval-cache-cases "$VAL_CASES" --val-cases "$VAL_CASES" \
-  --output "$RUN_OUTPUT" "${RESUME_ARGS[@]}" 2>&1 | tee -a "$RUN_OUTPUT/train.log"
+  --output "$RUN_OUTPUT" "${RESUME_ARGS[@]}" "${EXECUTION_ARGS[@]}" 2>&1 | tee -a "$RUN_OUTPUT/train.log"
 
 # Select on validation only. TEST is read after all training is complete.
 EVAL_CHECKPOINT="$RUN_OUTPUT/last.pth"

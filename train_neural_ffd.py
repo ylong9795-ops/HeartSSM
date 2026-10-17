@@ -33,6 +33,7 @@ from utils.neural_ffd_losses import NeuralFFDLoss,reconstruction_metrics
 from utils.slice_supervision import MeshSliceSupervisor
 from utils.slice_evaluation import render_source_slice,source_renderer_identity
 from utils.validation_runtime import ValidationRuntime,reference_signature
+from utils.training_execution import configure_execution,StepProfiler
 
 ROOT = Path(__file__).resolve().parent
 CHECKPOINT_VERSION = 'neural-heartffd-checkpoint-v1'
@@ -286,12 +287,15 @@ def best_checkpoint_candidates(summary):
 
 
 def compute_objective(model,batch,criterion,slicer,stage):
-    output = model(batch)
-    slices = slicer(output['vertices_4d'],batch) if stage=='joint' else None
-    losses = criterion(output,batch['vertices_gt'],slice_result=slices,
-        control_spacings_mm=model.control_spacings_mm,
-        regional_spacing_mm=model.regional_spacing_mm if model.regional_shape else None,
-        regional_motion_spacings_mm=model.regional_motion_spacings_mm if model.regional_motion else None,stage=stage)
+    with torch.profiler.record_function('joint/base_forward'):
+        output = model(batch)
+    with torch.profiler.record_function('joint/slice_supervision'):
+        slices = slicer(output['vertices_4d'],batch) if stage=='joint' else None
+    with torch.profiler.record_function('joint/gt_and_geometry_loss'):
+        losses = criterion(output,batch['vertices_gt'],slice_result=slices,
+            control_spacings_mm=model.control_spacings_mm,
+            regional_spacing_mm=model.regional_spacing_mm if model.regional_shape else None,
+            regional_motion_spacings_mm=model.regional_motion_spacings_mm if model.regional_motion else None,stage=stage)
     return output,losses,slices
 
 
@@ -618,8 +622,16 @@ def main():
                         help='Prefetched batches per training reader worker')
     parser.add_argument('--slice-backend',choices=('serial','batched'),default='batched',
                         help='Equivalent differentiable slice execution; batched groups cells on GPU')
-    parser.add_argument('--slice-cell-chunk',type=int,default=16,
+    parser.add_argument('--slice-cell-chunk',type=int,default=None,
                         help='Maximum section cells per batched slice group; controls temporary GPU memory')
+    parser.add_argument('--memory-profile',choices=('default','throughput'),default='default',
+                        help='Throughput: larger CNN/slice batches, no CNN recomputation, equivalent boundary-only objective')
+    parser.add_argument('--cnn-chunk-size',type=int)
+    parser.add_argument('--checkpoint-cnn',action=argparse.BooleanOptionalAction,default=None)
+    parser.add_argument('--slice-query-chunk',type=int)
+    parser.add_argument('--boundary-only',action=argparse.BooleanOptionalAction,default=None)
+    parser.add_argument('--batch-size',type=int,help='Explicit optimisation batch change; recorded separately from execution tuning')
+    parser.add_argument('--profile-steps',type=int,default=0,help='Bounded CPU/CUDA profiler trace; zero disables')
     args = parser.parse_args()
     if sum(value is not None for value in (args.resume,args.initialize,args.evaluate)) > 1:
         parser.error('--resume, --initialize and --evaluate are mutually exclusive')
@@ -627,10 +639,11 @@ def main():
         parser.error('Evaluation workers must be nonnegative and cache size positive')
     if (args.train_workers is not None and args.train_workers<0) or args.train_prefetch<1:
         parser.error('Training reader workers must be nonnegative and prefetch positive')
-    if args.slice_cell_chunk<1:
-        parser.error('Slice cell chunk must be positive')
+    if any(v is not None and v<1 for v in (args.slice_cell_chunk,args.cnn_chunk_size,args.slice_query_chunk,args.batch_size)) or args.profile_steps<0:
+        parser.error('Execution chunks/batch must be positive; profile steps nonnegative')
     config,data_config = load_config(args.config)
     training = config['training']
+    batch_size = args.batch_size or training['batch_size']
     reader_workers = training['workers'] if args.train_workers is None else args.train_workers
     device = args.device or training['device']
     os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG',':4096:8')
@@ -666,6 +679,8 @@ def main():
     train = dataset_from_config(data_config)
     identity = data_identity(data_config)
     runtime = dict(max_cases=args.max_cases,stage_override=args.stage)
+    if batch_size != training['batch_size']:
+        runtime['batch_size'] = batch_size
     epoch,offset,step = 0,0,0
     if args.resume:
         model,saved = load_checkpoint(args.resume,device)
@@ -685,14 +700,20 @@ def main():
         restore_rng(saved,device)
     criterion = NeuralFFDLoss(model.chamber_ranges,model.faces,**config['loss']).to(device)
     slicer = MeshSliceSupervisor(model.chamber_ranges,model.faces,model.norm_to_mm,**config['slice'],
-        execution_backend=args.slice_backend,cell_chunk_size=args.slice_cell_chunk).to(device)
+        execution_backend=args.slice_backend,cell_chunk_size=args.slice_cell_chunk or 16).to(device)
+    execution = configure_execution(model,slicer,objective_mode=criterion.objective_mode,
+        memory_profile=args.memory_profile,cnn_chunk_size=args.cnn_chunk_size,checkpoint_cnn=args.checkpoint_cnn,
+        slice_cell_chunk=args.slice_cell_chunk,slice_query_chunk=args.slice_query_chunk,boundary_only=args.boundary_only)
+    execution['batch_size'] = batch_size
+    (output_dir/'execution.json').write_text(json.dumps(execution,indent=2)+'\n')
+    print('Training execution:',json.dumps(execution),flush=True)
     count = min(args.max_cases or len(train),len(train))
     if offset<0 or offset>=count or epoch<0 or epoch>training['epochs']:
         raise ValueError('Checkpoint training position outside selected dataset')
     best_path = output_dir/'best_metrics.json'
     best = json.loads(best_path.read_text()) if args.resume and best_path.exists() else {}
     best = {key:value for key,value in best.items() if value['step']<=step}
-    with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator, (output_dir/'history.jsonl').open('a') as history:
+    with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator, (output_dir/'history.jsonl').open('a') as history, StepProfiler(args.profile_steps,output_dir,device) as profiler:
         while epoch<training['epochs']:
             epoch_start = time.perf_counter()
             stage = args.stage or stage_for_epoch(epoch,config)
@@ -705,7 +726,7 @@ def main():
                 group['lr'] = rate
             generator = torch.Generator().manual_seed(training['seed']+epoch)
             order = torch.randperm(count,generator=generator).tolist()
-            loader = training_loader(train,order[offset:],batch_size=training['batch_size'],
+            loader = training_loader(train,order[offset:],batch_size=batch_size,
                 workers=reader_workers,prefetch=args.train_prefetch,device=device,generator=generator,stage=stage)
             model.train()
             if training.get('freeze','none')!='none':
@@ -716,8 +737,8 @@ def main():
             stopping = False
             io_seconds,compute_seconds,processed_samples = 0.,0.,0
             data_wait_start = time.perf_counter()
-            with tqdm(loader,total=math.ceil(count/training['batch_size']),
-                      initial=math.ceil(offset/training['batch_size']),
+            with tqdm(loader,total=math.ceil(count/batch_size),
+                      initial=math.ceil(offset/batch_size),
                       desc=f"Epoch {epoch+1}/{training['epochs']} [{stage}]",
                       dynamic_ncols=True,mininterval=1.,leave=False) as progress:
                 for batch in progress:
@@ -727,7 +748,8 @@ def main():
                     batch = to_device(batch,device,non_blocking=torch.device(device).type=='cuda')
                     optimizer.zero_grad(set_to_none=True)
                     decoded,losses,slices = compute_objective(model,batch,criterion,slicer,stage)
-                    losses['total'].backward()
+                    with torch.profiler.record_function('joint/backward'):
+                        losses['total'].backward()
                     finite_gradients = [torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None]
                     if finite_gradients and not torch.stack(finite_gradients).all():
                         raise ValueError('Nonfinite network gradient')
@@ -752,7 +774,8 @@ def main():
                                 chamber_mesh_delta_rms_mm={c:float(mesh_delta[:,:,a:b].square().sum(-1).mean().sqrt()) for c,(a,b) in zip(CHAMBERS,model.chamber_ranges.tolist())},
                                 chamber_motion_rmse_mm={c:float(motion_error[:,:,a:b].square().sum(-1).mean().sqrt()) for c,(a,b) in zip(CHAMBERS,model.chamber_ranges.tolist())})
                             del off,field_delta,mesh_delta,center,motion_error
-                    optimizer.step()
+                    with torch.profiler.record_function('joint/optimizer'):
+                        optimizer.step()
                     batch_cases = batch['masks'].shape[0]
                     offset += batch_cases
                     step += 1
@@ -796,8 +819,11 @@ def main():
                     processed_samples += batch_cases
                     if slices is not None:
                         record['slice_diagnostics'] = slices['diagnostics']
-                        record['slice_execution'] = dict(backend=args.slice_backend,cell_chunk_size=args.slice_cell_chunk)
+                        record['slice_execution'] = dict(backend=args.slice_backend,cell_chunk_size=slicer.cell_chunk_size,
+                            query_chunk_size=slicer.chunk_size,boundary_only=slicer.boundary_only)
+                    record['execution'] = execution
                     history.write(json.dumps(record,allow_nan=False)+'\n');history.flush()
+                    profiler.step()
                     loss_sum += record['total']*batch_cases
                     loss_samples += batch_cases
                     next_epoch,next_offset = (epoch+1,0) if offset==count else (epoch,offset)
@@ -834,7 +860,7 @@ def main():
             if 'encoder_diagnostics' in report:
                 summary['encoder_diagnostics'] = report['encoder_diagnostics']
             summary['training_performance'] = dict(reader_workers=reader_workers,prefetch=args.train_prefetch,
-                slice_backend=args.slice_backend,slice_cell_chunk=args.slice_cell_chunk,
+                slice_backend=args.slice_backend,slice_cell_chunk=slicer.cell_chunk_size,execution=execution,
                 processed_samples=processed_samples,io_wait_seconds=io_seconds,compute_seconds=compute_seconds,
                 timing_scope='current invocation segment; includes reader startup')
             report.update(epoch=epoch_number,step=step,epoch_summary=summary)

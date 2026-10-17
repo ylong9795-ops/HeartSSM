@@ -175,6 +175,220 @@ See the [configuration](configs/neural_ffd.yaml) and
 Existing full-cycle baseline results do not establish that all Shape/Motion
 accuracy and continuous safety requirements are met.
 
+## Physical observation residual features
+
+`utils/observation_residual.py` connects true mesh-plane sections, physical
+arc-length quadrature and the observed model-grid SDF. It returns packed world
+positions and in-plane correction vectors in mm, signed distances, raw SDF
+gradients/norms, FOV validity, boolean confidence and arc-length weights, with
+patient/frame/view/chamber indices and actual cycle phases.
+
+```python
+from utils.observation_residual import ObservationResidualExtractor
+
+extractor = ObservationResidualExtractor(chamber_ranges, faces, norm_to_mm)
+residual = extractor(vertices_base_mm, observations, pose=observations["pose_gt"])
+# Real inference supplies an estimated pose using the same probe_R/probe_t contract.
+```
+
+Pass the model grid's `pixel_spacing` together with `sdf_units="mm"` and
+`MaskTransform(sdf_normalize=False)`. Pose is explicit; `probe_t` is multiplied
+once by `norm_to_mm`. Missing sections are flagged with empty point ranges;
+empty/full masks, flat gradients and out-of-FOV samples supply no confident
+direction. Raster EDT can have pixel bias even for a GT rerender, so this
+feature extractor does not replace exact geometric supervision or acceptance.
+It contains no learned parameters, FFD aggregation or Refiner training path.
+
+Implementation mechanisms were checked against DeepMesh's
+[physical coordinate mapping and contour supervision](https://github.com/ImperialCollegeLondon/DeepMesh/blob/main/train_motion.py)
+and [projection helper](https://github.com/ImperialCollegeLondon/DeepMesh/blob/main/utils.py).
+Its probabilistic vertex projection is different from the true-section SDF
+operator implemented here; no DeepMesh code is copied.
+
+`utils/ffd_observation_splat.py` maps these hints to the original Fine lattice
+through the SAME `bspline_support_physical` kernel as FFD evaluation. Each
+point votes to 64 nodes using `index_add_`; physical arc length and confidence
+weight both the vector numerator and support denominator. Four chamber blocks
+remain separate in `[B,T,16,Gx,Gy,Gz]` (LV, LA, RV, RA; each dx, dy, dz,
+support). For 24 phases and the original Fine grid this is
+`[B,24,16,24,24,32]`; 16 is a feature channel count, not a Motion latent size.
+Vectors are clipped by physical norm; invalid/nonfinite/unsupported samples
+have no vote. Support is accumulated evidence, not a probability.
+
+```python
+from utils.ffd_observation_splat import build_missing_section_recovery, splat_observation_residuals
+
+recovery = build_missing_section_recovery(
+    vertices_base_mm, observations, residual, pose=observations["pose_gt"],
+    chamber_ranges=chamber_ranges, faces=faces, norm_to_mm=norm_to_mm)
+packed = splat_observation_residuals(
+    residual, model.control_origins_mm[2], model.control_spacings_mm[2], model.grid_shapes[2],
+    batch_size=vertices_base_mm.shape[0], frames=vertices_base_mm.shape[1], recovery=recovery)
+features = packed["features"]
+```
+
+Recovery uses observed model-grid SDF zero crossings and the current predicted
+chamber surface. Detached nearest-surface anchors receive low-confidence
+vectors toward the observed boundary, including normal-plane capture. It uses
+no GT vertices or patient optimisation. Missing observed sections require this
+explicit recovery result; `cell_needs_recovery` and `cell_recovery_available`
+distinguish absent evidence from a usable capture hint. Recovery probes use
+approximate edge weights with orientation bias, rather than true-curve arc
+length. These averaged features are not an analytic inverse FFD solution.
+The shared Refiner and composed forward path are implemented below; cohort
+training and full geometric acceptance are separate from these module tests.
+
+The accumulation/normalisation mechanism was checked against
+[PyTorch3D points_to_volumes.py](https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/ops/points_to_volumes.py);
+its trilinear voxel kernel is replaced by HeartSSM's existing physical cubic
+B-spline support. PyTorch3D is not added as a dependency.
+
+## Shared observation-driven FFD Refiner
+
+`net/joint_ffd_refiner.py` provides `ObservationFFDRefiner` (the shared network)
+and `JointFFDRefiner` (the complete composed forward path). The default network
+has **15,150 parameters**, Shape64/Motion32 conditions and hidden width 24.
+A grouped four-chamber input stem precedes learned fusion, two depthwise 3D
+residual blocks and a circular temporal Conv1d at each control node. It keeps
+the original Fine resolution and predicts one common world displacement field
+for the fixed-topology four-chamber mesh. No patient IDs, patient parameters
+or per-patient optimisation enter the network.
+
+```python
+from net.joint_ffd_refiner import JointFFDRefiner
+
+# base_model is an existing NeuralFFDNet with its checkpoint already loaded.
+joint = JointFFDRefiner(base_model)
+output = joint(observations, pose=observations["pose_gt"])
+vertices_final_mm = output["vertices_4d"]
+controls = output["refinement"]
+# controls["controls_res_mm"]: [B,24,24,24,32,3] for the original Fine setup.
+```
+
+The wrapper reads the base model's Fine origin, spacing and shape; it executes
+base prediction -> physical section residual -> chamber-separated splat ->
+shared Refiner -> `bspline_ffd_physical` at the CURRENT base vertices.
+Real inference must explicitly supply an estimated pose with the same units
+as the synthetic pose interface. No GT vertex fields are read by refinement.
+Zero output heads make the initial final mesh exactly equal to the base mesh.
+A patient with zero observation support receives zero correction even after
+training. The caller chooses whether to freeze base weights; gradients through
+the base and the ordinary observation path remain connected.
+
+The dynamic head predicts uniform periodic cubic B-spline coefficients in
+time. For raw static field S and evaluated dynamic field D(t), the outputs are
+`C(t)=cap(S+D(t)-D(0))`, `C_static=cap(S)` and
+`C_dynamic(t)=C(t)-C_static`. Thus reference dynamic correction is exactly zero,
+and the TOTAL control vector norm is smoothly limited to the configurable
+default 3 mm. The relative dynamic field alone can exceed that limit.
+`cap(v)=v/sqrt(1+sum((v/M)**2))` retains an identity derivative at zero, so a
+zero-initialised head can learn. The first update reaches the output heads;
+subsequent updates reach the feature network.
+
+`evaluate_residual_controls` evaluates returned `raw_static_mm` and
+`dynamic_coefficients_mm` at arbitrary cycle phases, with periodic values,
+velocities and accelerations. Default output phases are `0,...,(T-1)/T`;
+the last sampled phase is not an extra duplicate endpoint. Circular input
+modelling requires a full uniformly sampled cycle; missing observations retain
+their phase slots with zero support. Spatial/temporal processing uses bounded
+frame/node chunks. Residual controls have continuous-time evaluation, while the
+existing base decoder remains discrete: to refine a queried time, the caller
+must supply base vertices at that same time to `apply_residual_ffd`.
+
+The output retains the base `control_grids` for existing loss interfaces;
+refinement controls live separately under `refinement`. Physical spatial
+gradient, cyclic velocity and cyclic acceleration penalties are returned under
+`control_regularization` for explicit weighting by a training objective.
+The training CLI has not been switched to this architecture. A 3 mm control
+bound or small penalties do not certify positive Jacobians or mesh quality;
+Native Exact, GT Shape/Motion and complete composed-mesh geometry acceptance
+remain necessary before judging a trained model.
+
+Implementation mechanisms were reviewed against
+[MedNeXt blocks](https://github.com/MIC-DKFZ/MedNeXt/blob/main/nnunet_mednext/network_architecture/mednextv1/blocks.py),
+[Time-Series-Library circular embedding](https://github.com/thuml/Time-Series-Library/blob/main/layers/Embed.py)
+and [DiT output initialisation](https://github.com/facebookresearch/DiT/blob/main/models.py).
+Their full architectures are not imported.
+
+## GPU memory and Joint throughput
+
+The launcher now defaults to `MEMORY_PROFILE=throughput`. Direct CLI use is
+explicit: append `--memory-profile throughput`. It spends more GPU activation
+memory and larger work batches while preserving the active grouped geometric
+objective and all observed cells:
+
+| Execution control | Original | Throughput |
+|---|---:|---:|
+| CNN view/frame chunk | 6 | 72 |
+| CNN activation recomputation | on | off |
+| Slice cell chunk | 16 | 64 |
+| Nearest-distance query chunk | 256 | 1024 |
+| Paired slice work | geometric boundary + unused probability maps | batched geometric boundary only |
+
+`grouped_gt_boundary_v1` consumes per-cell physical boundary distances, not
+probability Dice/BCE. The throughput path therefore skips those unused raster
+maps, batches physical clipping/quadrature/distances and omits unnecessary
+ray-parity calculations for the squared boundary distance. Missing predicted
+sections and empty-target clearance retain the original semantics. This path
+is rejected for legacy objectives that use probability losses. Skipped
+probability diagnostics are explicitly marked, not presented as measured zero
+errors. Native Exact evaluation, sample spacing and observation membership
+are unchanged.
+
+Refiner observations now compute SDF gradients and `grid_sample` across the
+active cells together. Its default spatial chunk is 24 frames, temporal node
+chunk is the complete original Fine lattice (18,432 nodes), observation section
+chunk is 64 cells, splat chunk is 65,536 points and FFD chunk is 8 frames. These
+larger chunks use more temporary memory, with no per-patient parameter fitting
+or second full raster fitting objective.
+
+```bash
+# Same optimisation batch as the saved configuration; larger GPU work chunks.
+python train_neural_ffd.py --config YOUR_CONFIG --resume YOUR_CHECKPOINT \
+  --memory-profile throughput --exact
+
+# Optional, explicit new experiment with more cases per optimiser update.
+BATCH_SIZE=4 CNN_CHUNK_SIZE=144 MEMORY_PROFILE=throughput \
+  bash scripts/train_neural_ffd_1k_direct.sh
+```
+
+Use `--cnn-chunk-size`, `--slice-cell-chunk`, `--slice-query-chunk` or
+`--checkpoint-cnn` to override individual settings. `--batch-size` is separate:
+it changes optimiser updates per epoch and batchwise tail reductions, so it
+is recorded in the resume identity when different from the saved config.
+An old checkpoint's strict resume cannot silently change that identity; use
+an explicit new initialisation experiment when changing batch size. Execution
+chunks do not mutate checkpoint architecture/config dictionaries. Effective
+settings are saved to `execution.json` and per-step history. Already running
+Python processes acquire the new settings only on restart/resume.
+
+`--profile-steps 5` produces a bounded CPU/CUDA Chrome trace and operator table,
+with named base forward, slice, GT/geometry loss, backward and optimiser ranges;
+the Refiner has separate physical-observation, recovery, splat, network and FFD
+ranges. Profiling adds overhead and is disabled by default.
+
+`scripts/benchmark_joint_training.py` compares the same loaded weights and
+TRAIN case batch across execution profiles, checks loss/gradient differences,
+and records phase timing and CUDA peak memory without optimizer updates.
+`--with-refiner` includes the composed observation path; optional
+`--monitor-gpu-index` samples device-level utilisation (including other jobs).
+`scripts/benchmark_joint_throughput.py` isolates geometric slice execution on
+synthetic true sections. Neither benchmark claims full-epoch speed.
+
+Measured reports are under `outputs/joint_throughput_20261017/`. In one real
+TRAIN-case GPU-4 short benchmark, base Joint forward/loss/backward decreased
+from 3.323 s to 0.346 s while peak allocated memory increased from 1.97 GB to
+3.51 GB. Including the zero-initialised Refiner, throughput took 0.493 s and
+5.65 GB. Both comparisons passed the recorded numerical parity gates. These
+are warm fixed-case medians, not cohort epoch times or reconstruction accuracy.
+With the Refiner, batch 4 and CNN chunk 144 took 1.240 s per four-case step
+(0.310 s/case), with 22.15 GB allocated / 25.08 GB reserved peak memory.
+Device-level utilisation samples were mostly 94--100% after warmup (83.1%
+mean including warmup, potentially including other processes). Its paired
+four-case loss difference was 2.38e-7 and gradient difference relative to the
+global gradient peak was 1.03e-5. This larger-batch result is an engineering
+throughput test, not evidence of identical convergence to batch 1.
+
 ## TTO and geometry safety
 
 The [TTO implementation](REAL_TTO_IMPLEMENTATION.md) uses the frozen
@@ -320,3 +534,13 @@ loading. Fresh runs use the current main configs and paired slice targets.
 initialization remain unchanged. Its reconstruction benefit will be assessed
 separately after this cleanup. The [historical research report](docs/neural_ffd.rst)
 records the earlier experiments and commands for their corresponding revisions.
+
+
+## TTO scaffold
+
+The current TTO entry is `python -m tto.run` with `configs/tto.yaml`.
+It supports native-observation preflight and exact frozen-model initialization.
+Global/chamber alignment and Shape/Motion/joint optimization are explicit pending
+contracts. Chamber translations only generate initial candidates.
+See [the TTO architecture, cleanup record and commands](tto/README.md).
+The former TTO implementation reports describe retired protocols.

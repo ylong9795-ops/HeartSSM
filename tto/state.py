@@ -1,0 +1,89 @@
+"""Versioned patient state. No chamber offsets or frozen motion fields."""
+from dataclasses import dataclass, field, fields
+from enum import Enum
+
+import torch
+
+from .geometry.pose_math import transform_points
+
+STATE_VERSION = 'tto-state-v1'
+
+
+class Stage(str, Enum):
+    INITIALIZED = 'initialized'
+    GLOBAL_ALIGNED = 'global_alignment'
+    CHAMBER_INITIALIZED = 'chamber_candidates'
+    SHAPE = 'shape'
+    MOTION = 'motion'
+    JOINT = 'joint'
+
+
+@dataclass
+class TTOState:
+    patient_id: str
+    identity: dict
+    z_shape: torch.Tensor  # [1,64]
+    z_motion: torch.Tensor  # [1,32]
+    conditions: dict
+    vertices_reference: torch.Tensor  # [N,3], canonical physical mm
+    trajectory: torch.Tensor  # [24,N,3], original decoder output
+    global_transform: dict  # single shared canonical-to-patient SE(3)
+    observation_pose: dict | None = None  # three planes in patient coordinates
+    stage: Stage = Stage.INITIALIZED
+    diagnostics: dict = field(default_factory=dict)
+
+    def validate(self):
+        if not self.patient_id or self.identity.get('patient_id') != self.patient_id:
+            raise ValueError('State identity/patient mismatch')
+        if self.z_shape.shape != (1, 64) or self.z_motion.shape != (1, 32):
+            raise ValueError('Original Shape64 / Motion32 latents required')
+        if self.vertices_reference.ndim != 2 or self.vertices_reference.shape[-1] != 3:
+            raise ValueError('Reference must be [N,3]')
+        if self.trajectory.shape != (24, *self.vertices_reference.shape):
+            raise ValueError('A full 24-phase fixed-topology trajectory is required')
+        for value in (self.z_shape, self.z_motion, self.vertices_reference, self.trajectory):
+            if not torch.isfinite(value).all():
+                raise ValueError('Nonfinite TTO state')
+        if not torch.equal(self.vertices_reference, self.trajectory[0]):
+            raise ValueError('Reference differs from original decoder phase zero')
+        self._validate_pose(self.global_transform, ())
+        if self.observation_pose is not None:
+            self._validate_pose(self.observation_pose, (3,))
+        self.stage = Stage(self.stage)
+
+    @staticmethod
+    def _validate_pose(pose, prefix):
+        if set(pose) != {'R', 'center_mm'}:
+            raise ValueError('Rigid pose requires only R and center_mm')
+        r, t = pose['R'], pose['center_mm']
+        if r.shape != (*prefix, 3, 3) or t.shape != (*prefix, 3):
+            raise ValueError('Unexpected rigid pose dimensions')
+        if not torch.isfinite(r).all() or not torch.isfinite(t).all():
+            raise ValueError('Nonfinite rigid pose')
+        eye = torch.eye(3, device=r.device, dtype=r.dtype).expand_as(r)
+        if not torch.allclose(r.transpose(-1, -2) @ r, eye, atol=1e-5, rtol=1e-5) or not torch.allclose(
+                torch.linalg.det(r), r.new_ones(prefix), atol=1e-5, rtol=1e-5):
+            raise ValueError('Pose must be a proper SO(3) rotation')
+
+    def patient_trajectory(self):
+        return transform_points(self.trajectory, self.global_transform)
+
+    def to_payload(self):
+        self.validate()
+        # Storage performs the detach/copy; dataclasses.asdict cannot deepcopy
+        # non-leaf decoded tensors when an optimizer eventually supplies them.
+        payload = {item.name: getattr(self, item.name) for item in fields(self)}
+        payload.update(version=STATE_VERSION, stage=self.stage.value)
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload):
+        value = dict(payload)
+        if value.pop('version', None) != STATE_VERSION:
+            raise ValueError('Unsupported TTO state; legacy state migration is not implicit')
+        try:
+            result = cls(**value)
+        except TypeError as error:
+            raise ValueError('Unexpected or missing fields in TTO state') from error
+        result.validate()
+        return result

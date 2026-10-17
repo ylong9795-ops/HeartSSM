@@ -2,10 +2,12 @@
 """Export synchronized, consecutive 48-frame three-view patient sequences.
 
 No interpolation, temporal stride, duplication, wrapping, or spatial resizing.
-Only within-patient alignment is enforced. ED/ES locations may vary by patient.
-Qualification means structural consistency, NOT anatomical correctness.
+Within each 48-frame export, one consecutive native 24-frame subwindow must
+contain manual ED/ES AND cover a complete LV-area peak/minimum/next-peak cycle.
+Boundary margins are allowed. Patients without such a window are rejected.
+ECG/RR is not used. Qualification uses segmentation-derived LV area estimates.
 
-Dependencies: numpy, pydicom>=3 (and a decoder if the DICOM is compressed).
+Dependencies: numpy, scipy, pydicom>=3 (and a decoder if DICOM is compressed).
 Usage:
   python scripts/prepare_patient_48frames.py --check-only
   python scripts/prepare_patient_48frames.py --output outputs/patient_48frames
@@ -16,6 +18,7 @@ Output per patient:
     images: (48,H,W) or (48,H,W,3), native decoded pixels
     masks: (48,4,H,W), original LV/RV/LA/RA masks unchanged
     source_frame_indices, time_s, source_time_s, is_manual_ed_es
+    cycle24_source_frame_indices, cycle24_indices_in_sequence
   metadata.json: original/new ED/ES indices, timestamps, per-chamber sources
   original_labels/: original metadata, hand annotations, reports, selected contours
   audit.json at output root: selected/rejected patients and exact reasons
@@ -33,6 +36,11 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+
+if __package__:
+    from .locate_patient_cardiac_cycles import locate_cycles
+else:
+    from locate_patient_cardiac_cycles import locate_cycles
 
 ROOT = Path(__file__).resolve().parents[1]
 N_FRAMES = 48
@@ -60,7 +68,7 @@ def choose_window(n, ed, es):
     return indices
 
 
-def inspect_patient(root, patient):
+def inspect_patient(root, patient, *, require_native24=True):
     from pydicom import dcmread
 
     pid = patient['patient']
@@ -86,12 +94,13 @@ def inspect_patient(root, patient):
     require(declared is not None and dicom.stat().st_size == declared['bytes'],
             'DICOM missing from manifest or size mismatch')
     ds = dcmread(dicom, stop_before_pixels=True, specific_tags=[
-        'NumberOfFrames', 'FrameTime', 'Rows', 'Columns', 'SequenceOfUltrasoundRegions'])
+        'NumberOfFrames', 'FrameTime', 'FrameTimeVector', 'Rows', 'Columns', 'SequenceOfUltrasoundRegions'])
     require(int(ds.NumberOfFrames) == n, 'DICOM frame count mismatch')
     require(np.isclose(float(ds.FrameTime), meta['frame_time_ms']), 'frame time mismatch')
+    require(not hasattr(ds, 'FrameTimeVector'), 'variable frame timing needs explicit handling')
     regions = {str(r['plane']): r for r in meta['regions']}
     require(set(regions) == {'1', '2', '3'}, 'missing crop regions')
-    selected = {}
+    selected, lv_areas, lv_sources = {}, {}, {}
     for key in ('1', '2', '3'):
         plane = patient['planes'][key]
         folder = labels / plane['name']
@@ -111,7 +120,7 @@ def inspect_patient(root, patient):
         require((dr.RegionLocationMinX0, dr.RegionLocationMinY0,
                  dr.RegionLocationMaxX1, dr.RegionLocationMaxY1) ==
                 (r['x0'], r['y0'], r['x1'], r['y1']), 'DICOM crop region mismatch')
-        masks, records = [], []
+        masks, records, areas, sources = [], [], [], []
         for i, fr in enumerate(idx['frames']):
             tag = f'{plane["name"]}/frame_{i:04d}'
             require(fr['frame_index'] == i and fr['display_frame'] == i + 1,
@@ -134,6 +143,8 @@ def inspect_patient(root, patient):
             active = range(4) if key == '1' else (0, 2)
             require(all(mask[c].any() for c in active), f'{tag}: empty active chamber')
             require(key == '1' or not mask[[1, 3]].any(), f'{tag}: nonzero inactive chamber')
+            areas.append(int(mask[0].sum()))
+            sources.append(fr['chamber_sources']['LV'])
             contour = read_json(folder / fr['contours'])
             require(all(contour.get(k) == v for k, v in fr.items()),
                     f'{tag}: contour/index metadata mismatch')
@@ -146,10 +157,20 @@ def inspect_patient(root, patient):
                 records.append(fr)
         selected[key] = {'name': plane['name'], 'masks': np.stack(masks),
                          'records': records, 'region': r}
-    return base, dicom, meta, phases, indices, selected
+        lv_areas[key], lv_sources[key] = areas, sources
+    cycle_coverage = locate_cycles(lv_areas, phases['ED'], phases['ES'], indices.tolist(),
+                                   float(ds.FrameTime), sources=lv_sources)
+    cycle24 = cycle_coverage['native24']
+    require(cycle_coverage['status'] != 'review_required_lv_area', 'LV area cycle requires review before export')
+    if require_native24:
+        require(cycle24 is not None,
+                f"LV area cycle: {cycle_coverage['status']}; "
+                f"minimum required frames={cycle_coverage['minimum_frames_for_cycle_and_manual']}")
+        require(cycle24['inside_existing48'], 'LV area native24 falls outside the selected 48-frame window')
+    return base, dicom, meta, phases, indices, selected, cycle_coverage
 
 
-def export_patient(destination, base, dicom, meta, phases, indices, selected):
+def export_patient(destination, base, dicom, meta, phases, indices, selected, cycle_coverage):
     from pydicom.pixels import iter_pixels
 
     images = {key: [] for key in selected}
@@ -161,13 +182,15 @@ def export_patient(destination, base, dicom, meta, phases, indices, selected):
     start = int(indices[0])
     manual_flags = np.isin(indices, list(phases.values()))
     source_time = indices.astype(np.float64) * meta['frame_time_ms'] / 1000
+    cycle24_indices = np.asarray(cycle_coverage['native24']['source_frame_indices'], dtype=np.int32)
     output_meta = {'patient': base.name, 'frame_count': N_FRAMES,
                    'sampling': 'consecutive_native_frames', 'source_dicom': str(dicom.resolve()),
                    'source_frame_indices': indices.tolist(), 'frame_time_ms': meta['frame_time_ms'],
                    'source_phase_indices': phases,
                    'phase_indices': {ph: int(i - start) for ph, i in phases.items()},
+                   'cycle_coverage': cycle_coverage,
                    'chamber_channels': CHANNELS, 'planes': {},
-                   'qualification': 'structural checks only; no anatomical review'}
+                   'qualification': 'structural and segmentation-derived LV area cycle coverage checks'}
     for key, seq in selected.items():
         name = seq['name']
         image_array = np.stack(images[key])
@@ -175,7 +198,9 @@ def export_patient(destination, base, dicom, meta, phases, indices, selected):
         target = destination / f'{name}.npz'
         np.savez_compressed(target, images=image_array, masks=seq['masks'],
                             source_frame_indices=indices, source_time_s=source_time,
-                            time_s=source_time - source_time[0], is_manual_ed_es=manual_flags)
+                            time_s=source_time - source_time[0], is_manual_ed_es=manual_flags,
+                            cycle24_source_frame_indices=cycle24_indices,
+                            cycle24_indices_in_sequence=cycle24_indices-start)
         with np.load(target, allow_pickle=False) as saved:
             require(np.array_equal(saved['masks'], seq['masks']) and
                     np.array_equal(saved['images'], image_array), 'output roundtrip mismatch')
@@ -201,7 +226,7 @@ def export_patient(destination, base, dicom, meta, phases, indices, selected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--input', type=Path, default=ROOT / '患者逐帧分割整理_20261015')
+    parser.add_argument('--input', type=Path, default=ROOT / 'real_data')
     parser.add_argument('--output', type=Path, default=ROOT / 'outputs/patient_48frames')
     parser.add_argument('--patients', nargs='+', help='Optional patient IDs, e.g. C01 C02')
     parser.add_argument('--check-only', action='store_true', help='Validate and report; do not decode/export images')
@@ -211,7 +236,9 @@ def main():
     require(not args.patients or set(args.patients) <= known, 'unknown patient ID requested')
     require(not args.output.resolve().is_relative_to(args.input.resolve()), 'output must be outside input dataset')
     args.output.mkdir(parents=True, exist_ok=True)
-    audit = {'mode': 'check_only' if args.check_only else 'export', 'accepted': [], 'rejected': []}
+    audit = {'mode': 'check_only' if args.check_only else 'export',
+             'coverage_rule': 'one native24 subwindow retains manual ED/ES and covers a complete LV area cycle; no ECG/RR',
+             'accepted': [], 'rejected': []}
     report = args.output / ('validation.json' if args.check_only else 'audit.json')
     require(not report.exists(), f'refusing to overwrite existing report: {report}')
     for patient in manifest['patients']:
@@ -223,7 +250,7 @@ def main():
             final = args.output / pid
             require(args.check_only or not final.exists(), 'output patient already exists; choose a fresh output directory')
             data = inspect_patient(args.input, patient)
-            _, _, _, phases, indices, _ = data
+            _, _, _, phases, indices, _, cycle_coverage = data
             if not args.check_only:
                 temporary = Path(tempfile.mkdtemp(prefix=f'.{pid}-', dir=args.output))
                 export_patient(temporary, *data)
@@ -231,7 +258,8 @@ def main():
                 temporary = None
             row = {'patient': pid, 'first_source_frame': int(indices[0]),
                    'last_source_frame': int(indices[-1]),
-                   'phase_indices': {ph: int(i - indices[0]) for ph, i in phases.items()}}
+                   'phase_indices': {ph: int(i - indices[0]) for ph, i in phases.items()},
+                   'cycle24': cycle_coverage['native24']}
             audit['accepted'].append(row)
             print(f'OK {pid}: {row}', flush=True)
         except (ValueError, OSError, KeyError, TypeError, RuntimeError, AttributeError, IndexError) as exc:

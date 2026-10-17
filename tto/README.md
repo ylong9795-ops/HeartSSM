@@ -1,141 +1,141 @@
-# 真实全周期 Shape–Pose Joint TTO
+# TTO scaffold
 
-正式协议为 `real-tto-joint-v1`，入口是 `python -m tto.run`。原 NeuralFFDNet 的权重、64D Shape / 32D Motion 和24帧固定拓扑保留；主阶段优化患者独立的 Shape latent 与三视图共享周期 Pose。完整实现和已执行证据见仓库根目录 [REAL_TTO_JOINT_IMPLEMENTATION.md](../REAL_TTO_JOINT_IMPLEMENTATION.md)。
+本目录是清理后的最小 TTO 骨架。唯一入口为 `python -m tto.run`，
+唯一配置协议为 `tto-scaffold-v1`（`configs/tto.yaml`）。
+当前实现原生观测预检、冻结原模型的精确初始化、身份检查和新状态保存/恢复。
+空间配准和优化算法尚未实现，调用这些阶段会明确失败，退出码为 2。
 
-## 输入目录
-
-`RealTTODataset` 支持两种输入：
-
-1. 仓库已有的真实数据导出目录：患者原始DICOM、每帧标签、物理标定和手工ED/ES记录。读取器核对DICOM厘米标定与导出mm间距，选择包含ED且完整覆盖的一个RR。
-2. 每位患者一个 `tto_input.json` 的可移植合同。患者ID就是数据根目录下的单层文件夹名；ID不能重复，不需要写入Python源码。
-
-建议为新数据使用可移植合同：
+## 目录与职责
 
 ```text
-data_root/
-  NEW01/
-    tto_input.json
-    A2C.npz
-    A3C.npz
-    A4C.npz
-    A2C_images.npy
-    A3C_images.npy
-    A4C_images.npy
+tto/
+├── run.py / config.py          唯一 CLI 与严格配置
+├── pipeline.py / state.py      唯一阶段控制器与患者状态合同
+├── dataset.py / prior.py       真实观测合同与原 NeuralFFDNet 桥接
+├── io.py / gpu.py              原子保存、身份检查、GPU 资源工具
+├── geometry/
+│   ├── pose_math.py            SO(3)、刚体变换；无局部搜索
+│   ├── guard.py                原三维/4D 几何审核
+│   └── motion_metrics.py       独立运动指标；无冻结场传播或准入门控
+├── supervision/
+│   ├── slicing.py              复用 utils.slice_supervision 原切片核
+│   ├── observations.py         原生二维证据选择、物理时间映射
+│   ├── losses.py               无 GT 的原生 Dice/BCE/Boundary
+│   └── evaluation.py           原生独立评价
+├── alignment/
+│   ├── global_alignment.py     患者整体 SE(3) 配准合同（待实现）
+│   └── chamber_alignment.py    腔室初始候选合同（待实现）
+├── optimization/
+│   ├── shape.py                原 64D Shape 搜索合同（待实现）
+│   ├── motion.py               原 32D Motion 搜索合同（待实现）
+│   └── joint.py                Shape/Motion/整体位姿联合合同（待实现）
+├── evaluator.py                独立原生渲染与汇总底层
+├── synthetic_oracle.py         隔离隐藏 GT、保存终点后的独立评价
+├── visualization.py            新状态的原生叠图与 4D 网格预览
+├── experiments.py              阶段能力注册表，无第二运行入口
+└── validate.py                 新状态合同检查，无第二运行入口
 ```
 
-清单中的相对资源路径相对于患者目录。CLI的相对配置、数据根目录和输出路径按仓库根目录解析；命令从仓库根目录执行。
+建议的后续阶段顺序为初始化 → 整体配准 → 腔室初始候选 → Shape →
+Motion → 联合优化。这里定义职责，不假设这些算法已经完成。
 
-## 清单字段
+## 已确定的空间语义
 
-顶层字段：
+2026-10-17 确认：**逐腔室位移只用于生成初始对齐候选**。
+候选必须回到原始 Decoder 的 Shape64 / Motion32 表达，并接受四腔解剖审核。
+最终 Mesh 不附加腔室静态位移，状态合同也没有这类参数。
 
-| 字段 | 类型与含义 |
-|---|---|
-| `version` | 固定为 `real-tto-input-v1` |
-| `patient_id` | 与患者目录名一致 |
-| `cycle_start_s` | 所选完整RR起点，秒 |
-| `cycle_duration_s` | 正的RR时长，秒 |
-| `anchor_time_s` | 模型参考相位0的估计时间，必须落在所选RR内 |
-| `views` | 顺序固定为 A2C、A3C、A4C 的3个记录 |
-| `acquisition_status` | 真实采集/同步证据的描述；不代表真实三维标定已经验证 |
-| `initial_pose` | 可选，含 `R` `(3,3,3)` 和 `center_mm` `(3,3)`，依次为三个视图的估计旋转与中心 |
+`global_transform` 是唯一的整体刚体变换，以列向量约定表示
+`x_patient = R @ x_canonical + center_mm`，跨四腔和 24 帧共享。
+`trajectory` 保存原始 Decoder 的 canonical mm 输出，
+`patient_trajectory()` 才施加整体变换。
+`observation_pose` 表示患者坐标中的三切面位姿，未经配准时为
+`None`；初始化的单位整体变换不能被解释为已完成配准。
+原生评价和叠图需要显式提供合法切面位姿。
 
-时间应有限，三个视图必须使用同一时间基准。ED锚定是估计，不能直接等同于合成frame0的生理含义。内部字符串 `synthetic source phase mapping verified` 是隐藏GT合成适配器的专用标记，不能用于声明真实患者已经具备源合成时相真值。
+## 数据、模型与监督边界
 
-未提供 `initial_pose` 时使用合成TRAIN校准文件的共同初值。若有更好的初步估计，可以在清单中提供三个有限SO(3)旋转矩阵和与模型Mesh同一物理坐标系的mm中心；不传入逐帧Pose。它只作为未知Pose的搜索初值，后续仍执行多起点初始化和持续Shape–Pose联合优化，不是 `pose_gt`。
+- 保留真实 Mask/SDF 合同、24 个模型相位、各视图原生尺寸和物理像素间距。
+  原生 Mask 不缩放；只有编码器输入经过原 MaskTransform。
+- 真实监督使用选定 RR 内的原始帧，每条原生观测只使用一次；
+  根据真实时间插值相邻模型网格。二值监督不来自 GT Mesh。
+- 标注来源、信任权重、时间误差和未参与优化的单元均保留。
+  切片不存在时报告缺失；不计算质心/平面距离捕获力。
+- `prior.py` 保留冻结 NeuralFFDNet、全部已训练空间条件、
+  原始递归 Motion Decoder，以及初始化与原 forward 完全一致的检查。
+- Shape64 和 Motion32 的职责独立定义；不继承初始 latent 的小范围搜索、
+  Frozen-Field Motion-Lock、旧运动保护阈值或统一回退。
+- `geometry/guard.py` 保留三维/4D 几何审核；后端不可用时为
+  `UNVERIFIED`。初始化不运行几何准入，保存结果明确为
+  `geometry_status=NOT_EVALUATED`。
+- 隐藏 GT 由 `hidden_patient()` 单独返回，不进入观测或优化接口；
+  `evaluate_hidden()` 只读取已保存的新状态，并核对样本身份。
+  新的合成恢复测试编排与准入门控尚未实现。
+- `visualization.py` 已适配新状态，保留原生轮廓叠图和 24 相位 Mesh
+  预览；旧求解器历史曲线已移除。
 
-每个视图的字段：
+## 运行
 
-| 字段 | 类型与含义 |
-|---|---|
-| `name` | A2C / A3C / A4C |
-| `masks_npz` | NPZ路径，其中 `masks` 的形状为 `(T,4,H,W)` |
-| `mask_files` | 与 `masks_npz` 二选一；T个NPZ，每个 `masks` 为 `(4,H,W)` |
-| `channels` | Mask通道名称，必须恰为 LV、LA、RV、RA；推荐按此固定顺序导出 |
-| `times_s` | T个严格递增的原始观测时间，秒 |
-| `spacing_yx_mm` | `[行间距, 列间距]`，两个正有限数，mm |
-| `annotated` | `(T,4)` 布尔值，固定按 LV、LA、RV、RA 声明是否有标签 |
-| `sources` | `(T,4)` 来源字符串，顺序与 `annotated` 一致 |
-| `frame_ids` | 可选，T个原始帧标识；默认0至T−1，建议显式保存原始标识 |
-| `images_npy` | 无DICOM输入且 `data.load_images: true` 时必需；`(T,H,W)` 或 `(T,H,W,3)` 原图 |
-
-Mask必须是0/1的独立通道，不能传入一张0/1/2/3/4互斥类别图代替四通道。数组禁止依赖pickle对象。一个视图内H/W固定，不同视图、不同患者可以不同；原图必须与该视图Mask的时间和像素网格完全对应。`annotated=false` 的右心通道不是空腔负标签；已有数据的A2C/A3C默认仅LV/LA有效。
-
-当前读取器只根据 `channels` 重排Mask，不重排 `annotated` 和 `sources`；后两者必须采用上述固定腔室顺序。为避免歧义，建议所有数组及 `channels` 一致使用 LV、LA、RV、RA。
-
-图像方向与Mask方向必须一致。物理网格使用当前原生图像中心 `(W/2,H/2)`，保持原生spacing；不按心腔bounding box重新缩放。SDF由读取器以mm计算，内负外正，不能将已有归一化SDF当成原生Mask传入。
-
-原生时间范围必须包住全部24个目标输入时刻。读取器不会在已提供的时间范围之外外推。允许保留所选RR之外的原始帧来支持输入时刻插值，但临床Joint监督只使用 `cycle_start_s <= time < cycle_start_s + cycle_duration_s` 内的每个原生标注Cell一次。
-
-## 从已有数组生成清单
-
-以下示例只写输入适配清单。各NPZ/NPY必须先由真实数据导出，代码不会生成标签或假设新的时间、间距和来源。
-
-先在患者目录保存 `acquisition.json`，包含上表的 `cycle_start_s`、`cycle_duration_s`、`anchor_time_s` 和真实 `acquisition_status`。每个视图的NPZ包含 `masks`、`times_s`、`spacing_yx_mm`、`annotated`、`sources`、`frame_ids` 数组，四通道按LV/LA/RV/RA排列。
-
-```python
-import json
-from pathlib import Path
-import numpy as np
-
-folder = Path("path/to/data_root/NEW01")
-timing = json.loads((folder / "acquisition.json").read_text())
-contract = {**timing, "version": "real-tto-input-v1",
-            "patient_id": folder.name, "views": []}
-for view in ("A2C", "A3C", "A4C"):
-    with np.load(folder / f"{view}.npz", allow_pickle=False) as packed:
-        contract["views"].append({
-            "name": view,
-            "masks_npz": f"{view}.npz",
-            "images_npy": f"{view}_images.npy",
-            "channels": ["LV", "LA", "RV", "RA"],
-            "times_s": packed["times_s"].tolist(),
-            "spacing_yx_mm": packed["spacing_yx_mm"].tolist(),
-            "annotated": packed["annotated"].tolist(),
-            "sources": packed["sources"].astype(str).tolist(),
-            "frame_ids": packed["frame_ids"].tolist(),
-        })
-(folder / "tto_input.json").write_text(
-    json.dumps(contract, ensure_ascii=False, indent=2) + "\n")
-```
-
-另一个可选路径是在顶层指定 `dicom`，并为每个视图提供 `region` 的 `x0/y0/width/height`。当前DICOM图像读取分支按观测数组索引取DICOM帧；该路径要求数组第j行对应DICOM第j帧。对于各视图独立采集、稀疏帧或非连续原始帧ID，应使用已经逐帧对应的 `images_npy` 路径。`frame_ids` 保留来源标识，不会在DICOM读取分支中重新映射帧。
-
-## 标签来源与时间可信度
-
-默认配置的来源权重：
-
-| 来源 | 权重 |
-|---|---:|
-| `manual_ed_es`、`manual_review` | 1.0 |
-| `patient_adapted_model` | 0.25 |
-| `temporal_fallback` | 0.1 |
-| `not_applicable` | 0 |
-
-`synthetic_observed` 的1.0权重用于合成观察，不应把真实自动标签改名为该来源。未知来源必须在新版本配置的 `data.source_weights` 中明确声明，不能按当前Dice决定来源、删除困难Cell或调整可信度。这里的来源权重不等于最终置信度：当前真实相位因子为0.25，因此人工标签最终为0.25、自动标签为0.0625，均低于高可信阈值0.5。共同相位因子在归一化均值中抵消，不代表整体二维监督相对于先验被削弱。
-
-## 对新患者运行
-
-需要训练模型环境及原有几何依赖。当前服务器使用 `/home/yilong/.conda/envs/4dheart/bin/python`，几何扩展通过 `PYTHONPATH=outputs/real_tto_motion_locked_20261016/_geometry_site` 加载。若使用其他环境，应安装相同依赖；版本见输出的 `model_identity.json` 和 `tto/requirements.txt`。
-
-同时保留仓库的 `synthetic_bundle_20261009` 源几何包及其 `configs/geometry/source_support.json`。正式适配器直接复用其中的 `heart4d.geometry` 谓词和固定房室帽支持，并核对源资产身份。
+当前服务器已有依赖的解释器：
 
 ```bash
-python -m tto.run --help
-python -m tto.run --config configs/real_tto_joint_v1.yaml --patients NEW01 --data-root path/to/data_root --output outputs/new_patient_joint_v1 --stage preflight --device auto
-python -m tto.run --config configs/real_tto_joint_v1.yaml --patients NEW01 --data-root path/to/data_root --output outputs/new_patient_joint_v1 --stage all --device auto --resume
+export PATH="/home/yilong/.conda/envs/4dheart/bin:$PATH"
+python -m tto.run --describe
+python -m tto.run --patients C01 --stage preflight
+python -m tto.run --patients C01 --stage initialize
+python -m tto.run --patients C01 --stage initialize --resume
+python -m tto.run --stage validate --state outputs/tto_scaffold_v1/patients/C01/initialized.pth
 ```
 
-使用新版本输出目录。缺少匹配的合成门控时，`--stage all` 会先执行正式隐藏GT验证，不会直接跳过门控进入真实优化。`preflight` 包括实际GPU工作负载与几何依赖检查，不只是读取JSON；资源不足返回 `WAITING_FOR_GPU_RESOURCES`。`--batch-size` 控制mini-batch，`--device auto` 在建立主CUDA上下文前选择设备。
+可使用 `--config`、`--data-root`、`--output-dir` 指定配置和输出。
+默认不加载原始影像；导出叠图前需要启用 `data.load_images`。
+预检不会加载模型，初始化会核对 checkpoint SHA256。
+当前 CLI 的初始化只支持 CPU；原 `gpu.select_gpu()` 的实测峰值准入工具
+保留独立可测，GPU 工作负载探测尚未接入新状态机。
 
-首次门控还需要 `synthetic.data_config` 指向的合成TRAIN资产及与checkpoint匹配的 `prior.calibration`，不能仅凭checkpoint文件名跳过这些依赖。可通过 `synthetic.validation_gate` 引用已有正式门控，但必须通过科学配置、源码和种子身份核验；改变数据根目录等科学配置后，不应把旧门控复制成新协议的通过证据。
+状态使用 `tto-state-v1`，身份包含患者、输入、checkpoint、配置和 TTO
+源码摘要。恢复会拒绝身份不匹配的状态；旧协议状态不会隐式迁移。
+已有初始化需显式 `--resume`，不覆盖旧结果。
+初始化成功只证明工程合同，不代表重建、配准、几何或临床验证成功。
 
-正式Joint阶段为 `initial → pose_init → joint → evaluate → export`；也可通过 `--stage` 单独恢复相应阶段。`--resume` 恢复Shape、Pose、Adam、最优合法候选、冻结Motion场及随机状态，输入或科学协议身份不同会拒绝复用。`--arm` 支持七种正式对照；比较结果要求共同初始化和预声明预算，不能把已优化端点作为另一臂的初始化。
+## 本地清理记录
 
-## 时间映射与输出的解释
+清理基于服务器本地文件，而非远端清单。检查时
+`tto/inverse_v2/` 没有 `.py` 源码，仅有未跟踪的字节码缓存。
+缓存已从活跃包移除；原文件及逐文件 SHA256 清单保存于
+`outputs/tto_cleanup_20261017/inverse_v2_local.zip` 和
+`outputs/tto_cleanup_20261017/local_inventory.json`。
+这些缓存不能视为已审阅的 v2 源码，也未被移植进新架构。
 
-编码器使用24个模型槽，其Mask由原生SDF的时间插值得到。临床Joint损失使用原始二值标签，在对应的相邻Mesh时刻插值切片，包含23→0接缝；二者是不同用途。原始观察较稀疏时不保证每个模型槽都有直接标签，但仍解码和审核全部24帧。
+旧两套 pipeline、Shape/Pose/Joint 优化器、Motion-Lock、
+重复 synthetic prior、专用损失与多套 YAML 已移除。
+八个依赖旧状态/配置/优化器的脚本一并退役：
+`analyze_real_tto_joint_hidden.py`、`analyze_real_tto_joint_pose.py`、
+`audit_real_tto_joint.py`、`check_real_tto_joint_batch.py`、
+`diagnose_real_tto_dice.py`、`profile_real_tto_joint_original.py`、
+`report_real_tto_joint_progress.py`、`run_real_tto_coverage_rescue.py`。
+仍可独立读取历史产物的审核脚本保留。旧实现通过 Git 历史查阅；
+仓库根目录两份旧 TTO 实施报告已标注为历史协议。
+`configs/real_tto_prior_calibration.json` 作为历史测量保留，
+新入口不读取其中的 Pose、Shape 搜索范围或运动阈值。
+既有实验输出和 checkpoint 保留。原 `net/`、`data/`、`utils/`
+及训练实现不属于本次 TTO 清理的修改范围。
 
-每位患者在 `patients/<ID>/states/`、`export/`、`evaluation/` 保存状态、Mesh、Pose、latent、冻结场、逐Cell Native Dice和几何/Motion记录；检查点位于 `checkpoints/<ID>/`，可视化位于 `visualizations/<ID>/`。`export/completed.json` 与 `states/export.pth` 是提交端点的共同标记，单有中途检查点不代表完成。
+## 验证
 
-参考/保存Mesh、跨腔和连续线性轨迹的验收与完整空间FFD场证书分开报告，后者当前为UNVERIFIED。Motion保持是相对于初始预测，不能证明初始生理运动正确。真实数据无3D Mesh/Pose GT，Native Dice改善不能单独证明真实三维Shape或绝对Pose更准确。当前队列和消融状态以版本输出目录的中文报告及独立审核为准。
+```bash
+python -m unittest discover -s tests -p 'test_real_tto*.py' -v
+python -m unittest discover -s tests -p test_tto_scaffold.py -v
+```
+
+测试覆盖原生矩形网格与物理映射、独立渲染、24 帧梯度、
+原始 Dice/BCE/Boundary 数值一致性、分数时刻插值与患者梯度隔离、
+GPU 资源工具、无捕获缺失切片、新状态身份隔离，以及真实 checkpoint
+的原 forward 一致性与 Shape/Motion 梯度。checkpoint 不可用时，
+真实模型测试会明确跳过。
+
+2026-10-17 本地验收：完整 unittest 套件 **102 项通过，零失败、零跳过**。
+C01 已通过正式 CLI 的原生预检、224 网格原模型初始化、恢复及新状态检查；
+四项原 forward 差异均为 0。状态仍明确标为未配准、未审核几何、未执行优化。
+日志、缓存清单和汇总位于 `outputs/tto_cleanup_20261017/`，
+汇总文件为 `verification.json`。

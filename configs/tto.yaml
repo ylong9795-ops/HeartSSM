@@ -1,0 +1,35 @@
+version: tto-scaffold-v1
+prior:
+  checkpoint: outputs/neural_ffd_1k_long_20261010_225918/best_joint.pth
+  sha256: 8c01b3bccb1d3bb70547b2fd6c844fd06542632533261576177b5bcacaaa570f
+  shape_dim: 64
+  motion_dim: 32
+data:
+  root: real_data
+  frames: 24
+  model_size: 224
+  sdf_clip_mm: 15.0
+  canonical_fov_mm: {A2C: 231.902, A3C: 226.07, A4C: 209.037}
+  load_images: false
+  source_weights: {manual_ed_es: 1.0, manual_review: 1.0, synthetic_observed: 1.0, patient_adapted_model: 0.25, temporal_fallback: 0.1, not_applicable: 0.0}
+supervision:
+  max_nearest_time_error_ms: 25.0
+  unverified_phase_confidence: 0.25
+  trusted_confidence_threshold: 0.5
+loss:
+  sigma_mm: 1.0
+  pixel_stride: 4
+  chunk_size: 256
+  cell_chunk_size: 8
+  dice_weight: 1.0
+  bce_weight: 0.1
+  boundary_weight: 0.1
+  target_mode: binary_native_v1
+alignment:
+  chamber_mode: initial_candidates_only
+runtime:
+  device: cpu
+  threads: 4
+  seed: 2026
+output:
+  root: outputs/tto_scaffold_v1

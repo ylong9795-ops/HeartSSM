@@ -9,7 +9,7 @@ class FrozenNeuralFFDPrior:
     def __init__(self, checkpoint, *, device='cpu', expected_sha256=None):
         self.checkpoint_sha256 = sha256(checkpoint)
         if expected_sha256 and self.checkpoint_sha256 != expected_sha256:
-            raise ValueError('Synthetic checkpoint SHA256 mismatch')
+            raise ValueError('Pretrained checkpoint SHA256 mismatch')
         self.model, self.saved = load_checkpoint(checkpoint, device)
         self.model.eval().requires_grad_(False)
         if (self.model.shape_dim, self.model.motion_dim, self.model.frames) != (64, 32, 24):

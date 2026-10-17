@@ -132,7 +132,7 @@ def batched_plane_segments(vertices_mm, faces, rotations, translations_mm):
     return segments,present
 
 
-def batched_signed_segment_distance(points, segments, present, chunk_size=256):
+def batched_signed_segment_distance(points, segments, present, chunk_size=256, *, signed=True):
     """Same nearest-segment distance and odd parity, batched over section cells.
 
     Invalid padded/zero-length segments participate in neither nearest search
@@ -149,12 +149,15 @@ def batched_signed_segment_distance(points, segments, present, chunk_size=256):
             closest = a[:,None]+u.clamp(0,1)[...,None]*ab[:,None]
             squared = (p[:,:,None]-closest).square().sum(-1)
             nearest = squared.masked_fill(~present[:,None],float('inf')).argmin(-1)
-            dy = ab[...,1]
-            denominator = torch.where(dy.abs()>1e-16,dy,torch.ones_like(dy))
-            x_cross = a[:,None,:,0]+(p[:,:,None,1]-a[:,None,:,1])*ab[:,None,:,0]/denominator[:,None]
-            crosses = (((a[:,None,:,1]>p[:,:,None,1]) != (b[:,None,:,1]>p[:,:,None,1]))
-                       & (p[:,:,None,0]<x_cross) & present[:,None])
-            sign = 1-2*(crosses.sum(-1)%2).to(p)
+            if signed:
+                dy = ab[...,1]
+                denominator = torch.where(dy.abs()>1e-16,dy,torch.ones_like(dy))
+                x_cross = a[:,None,:,0]+(p[:,:,None,1]-a[:,None,:,1])*ab[:,None,:,0]/denominator[:,None]
+                crosses = (((a[:,None,:,1]>p[:,:,None,1]) != (b[:,None,:,1]>p[:,:,None,1]))
+                           & (p[:,:,None,0]<x_cross) & present[:,None])
+                sign = 1-2*(crosses.sum(-1)%2).to(p)
+            else:
+                sign = 1.
         chosen = segments.gather(1,nearest[:,:,None,None].expand(-1,-1,2,2))
         a,b = chosen[:,:,0],chosen[:,:,1]
         ab = b-a
@@ -209,6 +212,71 @@ def _smooth_distance(distance, beta_mm):
     return squared/((squared+beta_mm**2).sqrt()+beta_mm)
 
 
+def batched_clip_section_to_native(segments, present, spacings_yx, image_shape):
+    """Same physical clipping as clip_section_to_native; preserve padded cells."""
+    h, w = image_shape
+    spacing = spacings_yx.flip(-1)[:, None]
+    lower = segments.new_tensor([-w/2-.5, -h/2-.5])*spacing
+    upper = segments.new_tensor([w/2-.5, h/2-.5])*spacing
+    a, delta = segments[:, :, 0], segments[:, :, 1]-segments[:, :, 0]
+    parallel = delta.abs() < 1e-12
+    safe = torch.where(parallel, torch.ones_like(delta), delta)
+    first, last = (lower-a)/safe, (upper-a)/safe
+    enter = torch.where(parallel, float('-inf'), torch.minimum(first, last)).amax(-1).clamp_min(0)
+    leave = torch.where(parallel, float('inf'), torch.maximum(first, last)).amin(-1).clamp_max(1)
+    keep = present & (leave > enter) & ~(parallel & ((a < lower) | (a > upper))).any(-1)
+    clipped = torch.stack((a+enter[..., None]*delta, a+leave[..., None]*delta), 2)
+    return torch.where(keep[..., None, None], clipped, 0.), keep
+
+
+def packed_section_quadrature(segments, present, steps_mm):
+    """Physical quadrature across cells; coordinates and weights retain gradients."""
+    cell, slot = present.nonzero(as_tuple=True)
+    curves = segments[cell, slot]
+    length = (curves[:, 1]-curves[:, 0]).norm(dim=-1)
+    counts = (length/steps_mm[cell]).ceil().long().clamp_min(1)
+    owners = torch.repeat_interleave(torch.arange(len(curves), device=segments.device), counts)
+    offsets = counts.cumsum(0)-counts
+    sample = torch.arange(len(owners), device=segments.device)-offsets[owners]
+    fraction = (sample.to(segments)+.5)/counts[owners]
+    points = curves[owners, 0]+fraction[:, None]*(curves[owners, 1]-curves[owners, 0])
+    return points, length[owners]/counts[owners], cell[owners]
+
+
+def batched_paired_boundary_distance(predicted, pred_present, teacher, teacher_present,
+                                     spacings_yx, image_shape, *, beta_mm=1., chunk_size=256,
+                                     sample_step_mm=None):
+    """Equivalent symmetric boundary objective batched over nonempty sections.
+
+    The smooth distance uses squared unsigned distances, so ray parity is not
+    needed. Missing/empty cells keep the supervisor's recovery/clearance paths.
+    """
+    teacher = teacher.detach()
+    observed_pred, pred_visible = batched_clip_section_to_native(predicted, pred_present, spacings_yx, image_shape)
+    observed_gt, gt_visible = batched_clip_section_to_native(teacher, teacher_present, spacings_yx, image_shape)
+    step = spacings_yx.amin(-1).detach()
+    if sample_step_mm is not None:
+        step = torch.minimum(step, step.new_tensor(sample_step_mm))
+    cell_count = len(predicted)
+    parts, available = [], []
+    for source, source_present, destination, destination_present in (
+            (observed_gt, gt_visible, predicted, pred_present),
+            (observed_pred, pred_visible, teacher, teacher_present)):
+        points, weight, owner = packed_section_quadrature(source, source_present, step)
+        counts = torch.bincount(owner, minlength=cell_count)
+        size = max(1, int(counts.max()))
+        starts = counts.cumsum(0)-counts
+        slots = torch.arange(len(points), device=points.device)-starts[owner]
+        queries = points.new_zeros(cell_count, size, 2)
+        weights = weight.new_zeros(cell_count, size)
+        queries[owner, slots], weights[owner, slots] = points, weight
+        distance = batched_signed_segment_distance(queries, destination, destination_present, chunk_size, signed=False)
+        denominator = weights.sum(-1)
+        parts.append((_smooth_distance(distance, beta_mm)*weights).sum(-1)/denominator.clamp_min(1e-20))
+        available.append(denominator > 0)
+    return torch.stack(parts).sum(0)/torch.stack(available).sum(0).clamp_min(1)
+
+
 def paired_boundary_distance(predicted, teacher, spacing_yx, image_shape, *, beta_mm=1., chunk_size=256,
                              sample_step_mm=None):
     """Symmetric physical curve distance (mm), with a smooth zero at equality.
@@ -233,17 +301,17 @@ def paired_boundary_distance(predicted, teacher, spacing_yx, image_shape, *, bet
     return torch.stack(parts).mean() if parts else predicted.sum()*0
 
 
-def surface_capture_distance(points_mm, vertices_mm, faces, *, beta_mm=1., chunk_size=64, weights=None):
-    """Target boundary -> closest triangle distance for an absent section.
+def closest_surface_points(points_mm, vertices_mm, faces, *, chunk_size=64):
+    """Closest predicted triangle points, sharing the surface-capture kernel.
 
-    Closest faces/barycentric coordinates are selected without autograd, then
-    the selected points are evaluated with gradients. By the envelope theorem
-    this is the ordinary derivative of point-to-surface distance almost
-    everywhere, including when the whole mesh lies on one side of the plane.
-    It supplies both normal-plane capture and in-plane localisation, without
-    correspondence fitting to GT vertices or inventing a section at padding.
+    Face/barycentric choices are detached. Reconstructed points retain the
+    selected barycentric vertex graph. This gives the correct distance-loss
+    derivative by the envelope theorem, not a general derivative of the full
+    closest-point map. Feature-only recovery callers can use no_grad().
     """
-    distances = []
+    if chunk_size < 1:
+        raise ValueError('Positive closest-surface query chunk required')
+    closest_points = []
     for points in points_mm.detach().split(chunk_size):
         with torch.no_grad():
             tri = vertices_mm.detach()[faces]
@@ -276,9 +344,20 @@ def surface_capture_distance(points_mm, vertices_mm, faces, *, beta_mm=1., chunk
                 face_ids = torch.where(improve, ids, face_ids)
                 selected_bary = torch.where(improve[:, None], bary[rows, ids], selected_bary)
         closest = (vertices_mm[faces[face_ids]]*selected_bary[..., None]).sum(-2)
-        squared = (points-closest).square().sum(-1)
-        distances.append(squared/((squared+beta_mm**2).sqrt()+beta_mm))
-    distances = torch.cat(distances)
+        closest_points.append(closest)
+    return torch.cat(closest_points) if closest_points else vertices_mm.new_empty((0, 3))
+
+
+def surface_capture_distance(points_mm, vertices_mm, faces, *, beta_mm=1., chunk_size=64, weights=None):
+    """Target boundary -> closest triangle distance for an absent section.
+
+    By the envelope theorem, detached nearest-face/barycentric choices give
+    the ordinary distance derivative almost everywhere. This supplies normal
+    capture and in-plane localisation without fitting to GT vertices.
+    """
+    closest = closest_surface_points(points_mm, vertices_mm, faces, chunk_size=chunk_size)
+    squared = (points_mm.detach()-closest).square().sum(-1)
+    distances = squared/((squared+beta_mm**2).sqrt()+beta_mm)
     return distances.mean() if weights is None else (distances*weights).sum()/weights.sum()
 
 
@@ -356,7 +435,8 @@ class MeshSliceSupervisor(nn.Module):
                  execution_backend='serial', cell_chunk_size=16,
                  target_mode='binary_native_v1', supervision_grid='model_grid', reduction='cell_mean',
                  boundary_objective='legacy_probability_v1', boundary_sample_step_mm=None,
-                 boundary_fine_sample_step_mm=None, boundary_fine_start_fraction=.75):
+                 boundary_fine_sample_step_mm=None, boundary_fine_start_fraction=.75,
+                 boundary_only=False):
         super().__init__()
         self.register_buffer('chamber_ranges',torch.as_tensor(chamber_ranges).long().clone())
         self._ranges = tuple(map(tuple,self.chamber_ranges.cpu().tolist()))
@@ -379,6 +459,9 @@ class MeshSliceSupervisor(nn.Module):
         if boundary_objective == 'paired_boundary_distance_v1' and boundary_weight <= 0:
             raise ValueError('Paired boundary supervision and section recovery require positive boundary_weight')
         self.boundary_objective = boundary_objective
+        if type(boundary_only) is not bool or (boundary_only and boundary_objective != 'paired_boundary_distance_v1'):
+            raise ValueError('Boundary-only execution requires paired geometric boundary supervision')
+        self.boundary_only = boundary_only
         for step in (boundary_sample_step_mm, boundary_fine_sample_step_mm):
             if step is not None and (not np.isfinite(step) or step <= 0):
                 raise ValueError('Boundary quadrature steps must be positive finite mm')
@@ -605,30 +688,59 @@ class MeshSliceSupervisor(nn.Module):
                     teacher_segments, teacher_present = batched_plane_segments(gt[patient, frame, left:right], faces, r, tr)
                     teacher_intersects = teacher_present.any(-1)
                     teacher_soft = points.new_zeros(points.shape[:2])
-                    if teacher_intersects.any():
+                    if not self.boundary_only and teacher_intersects.any():
                         teacher_distance = batched_signed_segment_distance(points[teacher_intersects],
                             teacher_segments[teacher_intersects], teacher_present[teacher_intersects], self.chunk_size)
                         teacher_soft[teacher_intersects] = torch.sigmoid(-teacher_distance/self.sigma_mm)
                 # Never evaluate nearest distance against a dummy padded segment.
                 logits = points.new_zeros(points.shape[:2])
-                if intersects.any():
-                    distance = batched_signed_segment_distance(points[intersects], segments[intersects], present[intersects], self.chunk_size)
-                    logits = logits.index_copy(0, intersects.nonzero().flatten(), -distance/self.sigma_mm)
+                raster_cells = intersects & (~teacher_intersects if self.boundary_only else torch.ones_like(intersects))
+                if raster_cells.any():
+                    distance = batched_signed_segment_distance(points[raster_cells], segments[raster_cells], present[raster_cells], self.chunk_size)
+                    logits = logits.index_copy(0, raster_cells.nonzero().flatten(), -distance/self.sigma_mm)
+                paired = intersects & teacher_intersects
+                fast_curves = None
+                if self.boundary_only and paired.any():
+                    fast_curves = v.sum((1, 2))*0
+                    fast_curves = fast_curves.index_copy(0, paired.nonzero().flatten(),
+                        batched_paired_boundary_distance(segments[paired], present[paired], teacher_segments[paired],
+                            teacher_present[paired], spacing[paired], (h, w), beta_mm=self.sigma_mm,
+                            chunk_size=self.chunk_size, sample_step_mm=self.boundary_step_cap_mm))
+                # One small flag transfer per chunk, rather than repeated GPU
+                # synchronisation for each chamber/phase branch decision.
+                flags = torch.stack((intersects, teacher_intersects,
+                    masks[patient, frame, view, chamber].bool().flatten(1).any(-1)), -1).cpu().tolist()
+                if self.boundary_only and all(pred and truth for pred, truth, _ in flags):
+                    # The common paired case needs no per-cell GPU indexing,
+                    # scalar reads, rasterisation or Python nearest searches.
+                    zeroes = v.sum((1, 2))*0
+                    for key in self.weights:
+                        values[key].extend((fast_curves if key == 'boundary_mm' else zeroes).unbind())
+                    values['curve_mm'].extend(fast_curves.unbind())
+                    values['recovery_mm'].extend(zeroes.unbind())
+                    values['empty_target_mm'].extend(zeroes.unbind())
+                    _, visible = batched_clip_section_to_native(teacher_segments, teacher_present, spacing, (h, w))
+                    kinds = visible.any(-1).cpu().tolist()
+                    ordered_cells.extend(entries)
+                    missing_cells.extend([False]*len(entries))
+                    cell_kinds.extend(OBSERVATION_KINDS.index('paired_boundary' if flag else 'no_visible_gt_boundary') for flag in kinds)
+                    continue
                 for row, cell in enumerate(entries):
                     p, t, view_id, c = cell
                     zero = v[row].sum()*0
                     curve_loss = recovery = empty_target = zero
-                    foreground = bool(masks[p, t, view_id, c].any())
+                    has_pred, has_teacher, foreground = flags[row]
                     teacher_curve = teacher_segments[row, teacher_present[row]]
                     pred_curve = segments[row, present[row]]
-                    if foreground and not bool(teacher_intersects[row]):
+                    if foreground and not has_teacher:
                         raise MissingSectionError(f'GT section absent for observed foreground cell {cell}')
-                    if bool(intersects[row]):
+                    if has_pred:
                         truth = masks[p, t, view_id, c, ::self.pixel_stride, ::self.pixel_stride].flatten()[None]
-                        terms = {key: value[0] for key, value in self._terms(logits[row:row+1], truth,
+                        terms = dict(dice=zero, bce=zero, boundary_mm=zero) if self.boundary_only else {
+                            key: value[0] for key, value in self._terms(logits[row:row+1], truth,
                             torch.zeros_like(truth), teacher_soft[row:row+1]).items()}
                         if len(teacher_curve):
-                            curve_loss = paired_boundary_distance(pred_curve, teacher_curve,
+                            curve_loss = fast_curves[row] if fast_curves is not None else paired_boundary_distance(pred_curve, teacher_curve,
                                 spacing[row], (h, w), beta_mm=self.sigma_mm, chunk_size=self.chunk_size,
                                 sample_step_mm=self.boundary_step_cap_mm)
                             visible_gt = clip_section_to_native(teacher_curve, spacing[row], (h, w))
@@ -672,7 +784,7 @@ class MeshSliceSupervisor(nn.Module):
                     values['curve_mm'].append(curve_loss)
                     values['empty_target_mm'].append(empty_target)
                     ordered_cells.append(cell)
-                    missing_cells.append(not bool(intersects[row]))
+                    missing_cells.append(not has_pred)
                     cell_kinds.append(OBSERVATION_KINDS.index(kind))
         packed = {key: torch.stack(value) for key, value in values.items()}
         chambers = torch.tensor([cell[3] for cell in ordered_cells], device=vertices.device)
@@ -686,6 +798,7 @@ class MeshSliceSupervisor(nn.Module):
             boundary_units='mm', boundary_quadrature='native_pixel_spacing',
             boundary_smoothing_mm=self.sigma_mm,
             boundary_sample_step_cap_mm=self.boundary_step_cap_mm, joint_progress=self.joint_progress,
+            probability_terms_evaluated=not self.boundary_only,
             empty_target_policy='detached_gt_half_space; margin=min(native_half_pixel,gt_clearance)')
         if not all(torch.isfinite(value).all() for value in packed.values()):
             raise ValueError('Nonfinite per-cell slice supervision')

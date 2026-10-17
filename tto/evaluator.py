@@ -33,13 +33,6 @@ def dice_stats(rows):
         ge095=int((x >= .95).sum()), ge098=int((x >= .98).sum()))
 
 
-def score(rows):
-    stats = dice_stats(rows)
-    return (stats['ge098'], stats['minimum'] if stats['minimum'] is not None else -1,
-            stats['P01'] if stats['P01'] is not None else -1,
-            stats['P05'] if stats['P05'] is not None else -1,
-            stats['mean'] if stats['mean'] is not None else -1)
-
 
 class ExactNativeEvaluator:
     def __init__(self, model):
@@ -74,26 +67,16 @@ class ExactNativeEvaluator:
                         target_area_mm2=float(target.sum()*np.prod(native['spacing'][vi])), renderer_error=error))
         return rows
 
-    def evaluate(self, trajectory, pose, patient, *, stage, before=None, motion=None, geometry=None, output=None):
+    def evaluate(self, trajectory, pose, patient, *, stage, motion=None, geometry=None, output=None):
         rows = self.cells(trajectory, pose, patient, stage)
-        # Model/fallback annotations remain separate from human-reviewed labels.
-        strata = {source: dice_stats([r for r in rows if r['label_source'] == source])
-                  for source in sorted({r['label_source'] for r in rows})}
-        report = dict(patient=patient.patient_id, stage=stage, all_observations=dice_stats(rows), by_source=strata,
+        report = dict(patient=patient.patient_id, stage=stage, all_observations=dice_stats(rows),
+            by_source={s: dice_stats([r for r in rows if r['label_source'] == s])
+                       for s in sorted({r['label_source'] for r in rows})},
             by_view={v: dice_stats([r for r in rows if r['view'] == v]) for v in VIEWS},
             by_chamber={c: dice_stats([r for r in rows if r['chamber'] == c]) for c in CHAMBERS},
-            before_shape=dice_stats(before) if before is not None else None,
-            motion_relative_to_initial_prior=motion, geometry=geometry, renderer=source_renderer_identity(),
+            motion_diagnostics=motion, geometry=geometry, renderer=source_renderer_identity(),
             acquisition_status=patient.metadata['contract'].get('acquisition_status', 'UNVERIFIED'),
-            interpretation='2D observation agreement, source-stratified; no real 3D/Pose ground truth')
-        if before is not None:
-            lookup = {(r['phase'], r['view'], r['chamber']): r['exact_hard_dice'] for r in before}
-            for row in rows:
-                old = lookup[(row['phase'], row['view'], row['chamber'])]
-                row['before_shape_dice'] = old
-                row['change_from_before_shape'] = row['exact_hard_dice']-old
-            report['change_scope'] = ('Shape-only update at fixed Pose' if stage == 'shape_after' else
-                'Current stage versus pre-Shape baseline; final includes Joint Shape and Pose changes')
+            interpretation='Independent native 2D agreement; no real 3D/Pose ground truth')
         if output is not None:
             output = Path(output);output.mkdir(parents=True, exist_ok=True)
             with (output/'cells.csv').open('w', newline='') as stream:

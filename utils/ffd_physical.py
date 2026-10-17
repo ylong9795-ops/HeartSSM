@@ -30,6 +30,46 @@ def control_geometry(lower_mm, upper_mm, grid_shape):
     return lower - spacing, spacing
 
 
+def bspline_support_physical(points_mm, origin_mm, spacing_mm, grid_shape, *, strict=True):
+    """Shared cardinal cubic support for physical evaluation AND splatting.
+
+    [...,3] -> (flat_indices [...,64], weights [...,64], in_support [...]).
+    Flat node order is (x*Gy+y)*Gz+z. The closed physical support box and
+    roundoff tolerance are identical to bspline_ffd_physical. strict=False
+    returns zero weights for unsupported points, with safe indices; it does
+    not extrapolate observations or give clamped points a nonzero vote.
+    """
+    v = points_mm
+    if v.ndim < 2 or v.shape[-1] != 3 or not v.is_floating_point():
+        raise ValueError('Floating physical points [...,3] required')
+    shape = torch.as_tensor(grid_shape, device=v.device)
+    if shape.shape != (3,) or shape.dtype not in (torch.int32, torch.int64) or (shape < 4).any():
+        raise ValueError('Three integer grid dimensions >=4 required')
+    origin = torch.as_tensor(origin_mm, device=v.device, dtype=v.dtype)
+    spacing = torch.as_tensor(spacing_mm, device=v.device, dtype=v.dtype)
+    if (origin.shape != (3,) or spacing.shape != (3,) or (spacing <= 0).any()
+            or not all(torch.isfinite(x).all() for x in (v, origin, spacing))):
+        raise ValueError('FFD requires finite values and positive physical spacing')
+    q = (v - origin) / spacing
+    # Check the physical bounds first: FP rounding can move a boundary query
+    # a few ulps. Only roundoff within this explicitly checked box is removed.
+    lower, upper = origin + spacing, origin + (shape - 2) * spacing
+    tol = 8 * torch.finfo(v.dtype).eps * torch.maximum(lower.abs(), upper.abs()).clamp_min(1)
+    in_support = ~((v < lower - tol) | (v > upper + tol)).any(-1)
+    if strict and not in_support.all():
+        raise ValueError('Vertices outside cubic B-spline support domain (mm)')
+    q = torch.minimum(torch.maximum(q, torch.ones_like(q)), (shape - 2).to(q))
+    cell = torch.minimum(torch.floor(q).long(), shape - 3)
+    u = q - cell.to(q)
+    basis = bspline_basis(u)
+    shifts = torch.cartesian_prod(*[torch.arange(4, device=v.device)] * 3)
+    indices = cell[..., None, :] - 1 + shifts
+    flat_indices = (indices[..., 0] * shape[1] + indices[..., 1]) * shape[2] + indices[..., 2]
+    weights = (basis[..., 0, shifts[:, 0]] * basis[..., 1, shifts[:, 1]]
+               * basis[..., 2, shifts[:, 2]])
+    return flat_indices, weights*in_support[..., None], in_support
+
+
 def bspline_ffd_physical(vertices_mm, control_grid_mm, origin_mm, spacing_mm):
     """[B,N,3], [B,Gx,Gy,Gz,3], [3], [3] -> displacement [B,N,3].
 
@@ -43,29 +83,10 @@ def bspline_ffd_physical(vertices_mm, control_grid_mm, origin_mm, spacing_mm):
             or v.shape[0] != c.shape[0] or min(c.shape[1:4]) < 4
             or not v.is_floating_point() or v.dtype != c.dtype or v.device != c.device):
         raise ValueError('Matching floating vertices [B,N,3] and controls [B,Gx,Gy,Gz,3] required')
-    origin = torch.as_tensor(origin_mm, device=v.device, dtype=v.dtype)
-    spacing = torch.as_tensor(spacing_mm, device=v.device, dtype=v.dtype)
-    if (origin.shape != (3,) or spacing.shape != (3,) or (spacing <= 0).any()
-            or not all(torch.isfinite(x).all() for x in (v, c, origin, spacing))):
+    if not torch.isfinite(c).all():
         raise ValueError('FFD requires finite values and positive physical spacing')
-    shape = torch.tensor(c.shape[1:4], device=v.device)
-    q = (v - origin) / spacing
-    # Check the physical bounds first: FP rounding can move a boundary query
-    # a few ulps. Only roundoff within this explicitly checked box is removed.
-    lower, upper = origin + spacing, origin + (shape - 2) * spacing
-    tol = 8 * torch.finfo(v.dtype).eps * torch.maximum(lower.abs(), upper.abs()).clamp_min(1)
-    if ((v < lower - tol) | (v > upper + tol)).any():
-        raise ValueError('Vertices outside cubic B-spline support domain (mm)')
-    q = torch.minimum(torch.maximum(q, torch.ones_like(q)), (shape - 2).to(q))
-    cell = torch.minimum(torch.floor(q).long(), shape - 3)
-    u = q - cell.to(q)
-    basis = bspline_basis(u)  # [B,N,3,4]
-    shifts = torch.cartesian_prod(*[torch.arange(4, device=v.device)] * 3)
-    indices = cell[..., None, :] - 1 + shifts
-    flat_indices = (indices[..., 0] * c.shape[2] + indices[..., 1]) * c.shape[3] + indices[..., 2]
+    flat_indices, weights, _ = bspline_support_physical(v, origin_mm, spacing_mm, c.shape[1:4])
     points = torch.gather(c.reshape(c.shape[0], -1, 3), 1,
                           flat_indices.reshape(c.shape[0], -1, 1).expand(-1, -1, 3))
     points = points.reshape(v.shape[0], v.shape[1], 64, 3)
-    weights = (basis[..., 0, shifts[:, 0]] * basis[..., 1, shifts[:, 1]]
-               * basis[..., 2, shifts[:, 2]])
     return (weights[..., None] * points).sum(-2)

@@ -1,3 +1,6 @@
+> Historical protocol (retired 2026-10-17). Commands and acceptance rules below
+> describe the old implementation. Current entry and contracts: [tto/README.md](tto/README.md).
+
 # HeartSSM 正式真实数据 TTO 实现
 
 统一入口是 `python -m tto.run`。这是共享冻结合成先验、逐患者独立优化的 TTO；没有训练 PopulationAdapter，也没有修改原始模型、FFD 或几何准入阈值。

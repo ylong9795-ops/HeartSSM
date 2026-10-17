@@ -1,7 +1,6 @@
 """Native evaluation with explicit all-label / trusted / optimization coverage."""
-from .evaluator import ExactNativeEvaluator, dice_stats
-from .losses import observation_cells,native_cell,interpolate_cell
-from .io import write_json
+from ..evaluator import ExactNativeEvaluator, dice_stats
+from .observations import observation_cells,native_cell,interpolate_cell
 from data.mask_transform import CHAMBERS, VIEWS
 
 
@@ -14,14 +13,14 @@ def proportions(rows):
     return result
 
 
-class RealTTOEvaluator(ExactNativeEvaluator):
+class NativeEvaluator(ExactNativeEvaluator):
     def __init__(self, model, policy):
         super().__init__(model)
         self.policy = policy
 
     def annotated_cells(self, trajectory, pose, patient, stage):
         import numpy as np
-        from .evaluator import native_exact
+        from ..evaluator import native_exact
         rows=[]
         for evidence in observation_cells([patient],self.policy):
             vi,ci=evidence['view'],evidence['chamber'];chamber=CHAMBERS[ci]
@@ -37,15 +36,27 @@ class RealTTOEvaluator(ExactNativeEvaluator):
             rows.append(dict(patient=patient.patient_id,stage=stage,phase=evidence['phase'],
                 phase_upper=evidence['mesh_upper'],phase_alpha=evidence['mesh_alpha'],
                 view=VIEWS[vi],chamber=chamber,exact_hard_dice=float(dice),
-                native_frame=evidence['native_frame'],native_time_s=evidence['native_time_s'],time_error_ms=0.,
+                native_frame=evidence['native_frame'],native_time_s=evidence['native_time_s'],time_error_ms=evidence['time_error_ms'],
                 label_source=evidence['source'],source_weight=evidence['source_confidence'],
                 prediction_area_mm2=float(prediction.sum()*np.prod(spacing)),target_area_mm2=float(target.sum()*np.prod(spacing)),
                 renderer_error=error,confidence=evidence['confidence'],phase_confidence=evidence['phase_confidence'],
                 used_for_optimization=evidence['used'],supervision_reason=evidence['reason']))
         return rows
 
-    def selection_cells(self, trajectory, pose, patient, stage):
-        return [r for r in self.annotated_cells(trajectory,pose,patient,stage) if r['used_for_optimization']]
+    def cells(self, trajectory, pose, patient, stage, phases=None):
+        rows = self.annotated_cells(trajectory, pose, patient, stage)
+        return rows if phases is None else [r for r in rows if r['phase'] in phases]
+
+    def evaluate_state(self, state, patient):
+        state.validate()
+        if state.patient_id != patient.patient_id or state.identity['observations_sha256'] != patient.identity:
+            raise ValueError('Evaluation state and observations differ')
+        if state.observation_pose is None:
+            raise ValueError('Native evaluation requires registered observation-plane poses')
+        trajectory = state.patient_trajectory().detach().cpu().numpy()
+        pose = {key: value.detach().cpu().numpy() for key, value in state.observation_pose.items()}
+        rows = self.annotated_cells(trajectory, pose, patient, state.stage.value)
+        return self.summarize(rows), rows
 
     def summarize(self, rows):
         used = [r for r in rows if r['used_for_optimization']]

@@ -15,8 +15,11 @@ def export_visualizations(model,patient,state,folder):
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from PIL import Image
     folder=Path(folder);folder.mkdir(parents=True,exist_ok=True)
-    result=state['result'];trajectory=result['trajectory'].detach().cpu().numpy()
-    pose={key:value.detach().cpu().numpy() for key,value in result['pose'].items()}
+    state.validate()
+    if state.observation_pose is None:
+        raise ValueError('Native overlays require registered observation-plane poses')
+    trajectory=state.patient_trajectory().detach().cpu().numpy()
+    pose={key:value.detach().cpu().numpy() for key,value in state.observation_pose.items()}
     faces={c:value.cpu().numpy() for c,value in model.faces.items()}
     ranges=dict(zip(CHAMBERS,model.chamber_ranges.tolist()))
     for phase in (0,6,12,18):
@@ -37,24 +40,6 @@ def export_visualizations(model,patient,state,folder):
                     contours,_=cv2.findContours(mask.astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
                     cv2.drawContours(canvas,contours,-1,color,1)
             cv2.imwrite(str(folder/f'{name}_phase_{phase:02d}_native.png'),cv2.cvtColor(canvas,cv2.COLOR_RGB2BGR))
-    history=result['history']
-    figure,axes=plt.subplots(2,2,figsize=(9,6))
-    for key in ('dice','bce','boundary_mm'):
-        axes[0,0].plot([h['update'] for h in history],[h['components'][key] for h in history],label=key)
-    axes[0,0].set_title('Original slice components');axes[0,0].legend()
-    for key in ('shape','rotation','translation'):
-        axes[0,1].plot([h['update'] for h in history],[h['gradients'][key] for h in history],label=key)
-    axes[0,1].set_title('Parameter gradient norms');axes[0,1].legend()
-    axes[1,0].plot([h['update'] for h in history],[h['objective'] for h in history]);axes[1,0].set_title('Joint objective')
-    axes[1,1].step([h['update'] for h in history],[int(h['accepted']) for h in history]);axes[1,1].set_title('Candidate accepted')
-    figure.tight_layout();figure.savefig(folder/'optimization.png',dpi=120);plt.close(figure)
-    figure,axes=plt.subplots(2,2,figsize=(9,6))
-    for axis,chamber in zip(axes.flat,CHAMBERS):
-        metrics=result['motion_report']['metrics']['chambers'][chamber]
-        axis.plot(np.arange(24)/24,metrics['prior_volume_curve_ml'],label='Initial prior')
-        axis.plot(np.arange(24)/24,metrics['volume_curve_ml'],label='TTO')
-        axis.set(title=chamber,xlabel='Cycle phase',ylabel='Volume (mL)');axis.legend()
-    figure.tight_layout();figure.savefig(folder/'motion_volumes.png',dpi=120);plt.close(figure)
     lower=trajectory.min((0,1));upper=trajectory.max((0,1));center=(lower+upper)/2;radius=max(upper-lower)/2*1.05
     colors=('#d94b55','#eda849','#5085d9','#54bbbf');frames=[]
     figure=plt.figure(figsize=(5,5),dpi=80)

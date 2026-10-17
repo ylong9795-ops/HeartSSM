@@ -1,85 +1,13 @@
-"""Full-cycle native observations using the ORIGINAL Dice/BCE/Boundary terms.
-
-Only the heterogeneous grid adapter and confidence reduction live here. The
-mesh-plane kernels and three component definitions are reused without copying.
-"""
+"""No-GT native Dice/BCE/boundary supervision, without solver-specific priors."""
 import numpy as np
 import torch
-
 from data.mask_transform import CHAMBERS
-from utils.slice_supervision import (MeshSliceSupervisor, batched_plane_segments,
-                                     batched_signed_segment_distance)
-from .dataset import sdf_mm
+from utils.slice_supervision import MeshSliceSupervisor
+from .slicing import batched_plane_segments, batched_signed_segment_distance
+from .observations import observation_cells, native_cell
 
 
-def observation_cells(patients, policy, phases=range(24)):
-    """Fixed evidence-based membership; predictions/Dice never enter this policy."""
-    rows = []
-    for owner, patient in enumerate(patients):
-        contract = patient.metadata['contract']
-        synthetic = contract.get('acquisition_status') == 'synthetic source phase mapping verified'
-        timing_factor = 1. if synthetic else policy['unverified_phase_confidence']
-        if not synthetic and all('times' in view for view in patient.views):
-            start,duration,anchor=(float(contract[key]) for key in ('cycle_start_s','cycle_duration_s','anchor_time_s'))
-            for view_index,view in enumerate(patient.views):
-                for native_index,time_s in enumerate(view['times']):
-                    if not start<=time_s<start+duration:continue
-                    position=float(((time_s-anchor)/duration)%1)*24
-                    lower=int(np.floor(position))%24;alpha=position-np.floor(position)
-                    if alpha<1e-7:alpha=0.
-                    if alpha>1-1e-7:lower=(lower+1)%24;alpha=0.
-                    if len(phases)==1 and list(phases)[0]==0:
-                        if native_index!=patient.mapping[0][view_index]['nearest_index']:continue
-                    elif lower not in phases:continue
-                    for chamber in range(4):
-                        if not view['annotated'][native_index,chamber]:continue
-                        source_confidence=float(view['weights'][native_index,chamber])
-                        confidence=source_confidence*timing_factor
-                        rows.append(dict(owner=owner,phase=lower,mesh_upper=(lower+1)%24,mesh_alpha=float(alpha),
-                            view=view_index,chamber=chamber,native_index=native_index,
-                            native_frame=view['frame_ids'][native_index],native_time_s=float(time_s),
-                            source=view['sources'][native_index][chamber],confidence=confidence,
-                            source_confidence=source_confidence,phase_confidence=timing_factor,used=confidence>0,
-                            reason='Unique original frame inside selected RR; mesh interpolated at observed time; source phase alignment estimated'))
-            continue
-        for phase in phases:
-            native = patient.native(phase)
-            for view in range(3):
-                mapping = patient.mapping[phase][view]
-                timing_ok = abs(mapping['nearest_time_error_ms']) <= policy['max_nearest_time_error_ms']
-                for chamber in range(4):
-                    if not native['annotated'][view, chamber]:
-                        continue
-                    source = native['sources'][view][chamber]
-                    source_confidence = float(native['weights'][view, chamber])
-                    confidence = source_confidence*timing_factor if timing_ok else 0.
-                    rows.append(dict(owner=owner, phase=phase, view=view, chamber=chamber,
-                        mesh_upper=(phase+1)%24,mesh_alpha=0.,native_index=mapping['nearest_index'],
-                        native_frame=mapping['nearest_native_frame'],native_time_s=mapping.get('target_time_s',phase/24),
-                        source=source, confidence=confidence, source_confidence=source_confidence,
-                        phase_confidence=timing_factor, used=confidence > 0,
-                        reason=('nearest native time outside declared tolerance' if not timing_ok else
-                                'synthetic phase verified' if synthetic else
-                                'ED anchoring is an estimate; source frame0 equivalence unverified')))
-    return rows
-
-
-def native_cell(patient,row):
-    """One original observation, never a resampled binary mask."""
-    view=patient.views[row['view']];index=row['native_index'];chamber=row['chamber']
-    mask=view['masks'][index,chamber]
-    cache_key=('observed_sdf',row['view'],index,chamber)
-    if cache_key not in patient._native_cache:
-        patient._native_cache[cache_key]=sdf_mm(mask,view['spacing'])
-    return mask,patient._native_cache[cache_key],view['spacing']
-
-
-def interpolate_cell(trajectory,row):
-    alpha=row['mesh_alpha']
-    return (1-alpha)*trajectory[row['phase']]+alpha*trajectory[row['mesh_upper']]
-
-
-class RealTTOLoss:
+class NativeSupervision:
     def __init__(self, model, patients, config, policy, *, phases=range(24), stride=None):
         self.model, self.patients, self.config = model, patients, dict(config)
         self.rows = observation_cells(patients, policy, phases)
@@ -132,7 +60,7 @@ class RealTTOLoss:
         if trajectory.ndim != 4 or trajectory.shape[1] != 24:
             raise ValueError('Full [B,24,N,3] differentiable trajectory required')
         accumulated = {key: trajectory.new_zeros(self.batch_size)
-                       for key in ('dice', 'bce', 'boundary_mm', 'capture_prior')}
+                       for key in ('dice', 'bce', 'boundary_mm')}
         cell_terms, indices, missing,observation_ids = [], [], [],[]
         for group in self.groups:
             owners, phases, views = group['owner'], group['phase'], group['view']
@@ -148,22 +76,16 @@ class RealTTOLoss:
                 logits = -distances[index, :len(truth)]/self.config['sigma_mm']
                 absent = not bool(present[index].any())
                 if absent:
-                    # Missing foreground has no local section derivative. The
-                    # separate capture prior supplies a pose/shape recovery signal.
-                    empty_logits = logits*0-30.
+                    # The exact empty section has no local geometric derivative.
+                    # Report it for global alignment; invent no capture force.
+                    zero = (vertices[index].sum()+centers[index].sum()+rotations[index].sum())*0
+                    empty_logits = torch.full_like(logits, -30.)+zero
                     terms = self.supervisor._terms(empty_logits[None], truth[None], sdf[None])
-                    if truth.any():
-                        local = (vertices[index]-centers[index]) @ rotations[index]
-                        target_center = (group['points'][index, :len(truth)]*truth[:, None]).sum(0)/truth.sum()
-                        capture = local[:, 2].abs().amin()+self.config['capture_centroid_weight']*(local[:, :2].mean(0)-target_center).norm()
-                    else:
-                        terms = {key:value*0 for key, value in terms.items()}
-                        capture = vertices[index].sum()*0
+                    if not truth.any():
+                        terms = {key: value*0 for key, value in terms.items()}
                 else:
                     terms = self.supervisor._terms(logits[None], truth[None], sdf[None])
-                    capture = vertices[index].sum()*0
-                terms = {key:value.squeeze(0) for key,value in terms.items()}
-                terms['capture_prior'] = capture
+                terms = {key: value.squeeze(0) for key, value in terms.items()}
                 owner = row['owner'];confidence = row['confidence']
                 for key,value in terms.items():
                     # index_add preserves independent patient objectives/gradients.
@@ -174,7 +96,7 @@ class RealTTOLoss:
         loss = (self.config['dice_weight']*components['dice']+
                 self.config['bce_weight']*components['bce']+
                 self.config['boundary_weight']*components['boundary_mm'])
-        return dict(slice=loss, capture_prior=components['capture_prior'], components=components,
+        return dict(slice=loss, components=components,
                     cell_indices=indices, cell_terms=cell_terms, missing_sections=missing,
                     cell_observation_ids=observation_ids,
                     supervision_manifest=self.rows)
