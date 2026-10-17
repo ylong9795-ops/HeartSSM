@@ -10,8 +10,11 @@ def observation_cells(patients, policy, phases=range(24)):
     for owner, patient in enumerate(patients):
         contract = patient.metadata['contract']
         synthetic = contract.get('acquisition_status') == 'synthetic source phase mapping verified'
-        timing_factor = 1. if synthetic else policy['unverified_phase_confidence']
-        if not synthetic and all('times' in view for view in patient.views):
+        aligned = contract.get('input_mode') == 'aligned24'
+        phase_verified = aligned and all(contract['phase_alignment'][key] == 'VERIFIED'
+                                        for key in ('status', 'phase_grid_status'))
+        timing_factor = 1. if synthetic or phase_verified else policy['unverified_phase_confidence']
+        if not synthetic and not aligned and all('times' in view for view in patient.views):
             start,duration,anchor=(float(contract[key]) for key in ('cycle_start_s','cycle_duration_s','anchor_time_s'))
             for view_index,view in enumerate(patient.views):
                 for native_index,time_s in enumerate(view['times']):
@@ -54,6 +57,8 @@ def observation_cells(patients, policy, phases=range(24)):
                         phase_confidence=timing_factor, used=confidence > 0,
                         reason=('nearest native time outside declared tolerance' if not timing_ok else
                                 'synthetic phase verified' if synthetic else
+                                'aligned24 identity index; phase0/grid verified' if phase_verified else
+                                'aligned24 identity index; phase0/grid UNVERIFIED' if aligned else
                                 'ED anchoring is an estimate; source frame0 equivalence unverified')))
     return rows
 

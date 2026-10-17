@@ -1,0 +1,72 @@
+# Random Base; Shape30 + Motion30 + online Base/Refiner Joint120.
+data_config: configs/synthetic_data_1k.yaml
+encoder:
+  feature_transfer: direct_residual_v1
+  direct_pool_side: 2
+  direct_frame_gain: 1.0
+  direct_shape_gain: 1.0
+  shape_dim: 64
+  motion_dim: 32
+  width: 128
+  heads: 4
+  temporal_layers: 2
+  spatial_sides: [14, 7]
+  query_slots: 8
+  sdf_scale_mm: 15.0
+  cnn_chunk_size: 6
+  checkpoint_cnn: true
+decoder:
+  frames: 24
+  channels: 32
+  seed_shape: [6, 6, 8]
+  lower_mm: [-120.0, -110.0, -110.0]
+  upper_mm: [120.0, 110.0, 110.0]
+  regional_shape: true
+  global_shape_dim: 32
+  regional_grid_shape: [4, 4, 4]
+slice:
+  target_mode: paired_soft_geometry_v1
+  supervision_grid: native_grid
+  boundary_objective: paired_boundary_distance_v1
+  boundary_sample_step_mm: 0.5
+  boundary_fine_sample_step_mm: 0.25
+  boundary_fine_start_fraction: 0.75
+  sigma_mm: 1.0
+  pixel_stride: 4
+  chunk_size: 256
+  dice_weight: 1.0
+  bce_weight: 0.1
+  boundary_weight: 0.1
+loss:
+  objective_mode: grouped_gt_boundary_v1
+  observation_tail_fraction: 0.25
+  observation_tail_weight: 1.0
+  observation_boundary_threshold_mm: null
+  huber_beta_mm: 1.0
+  weights:
+    shape: 1.0
+    trajectory: 1.0
+    motion: 1.0
+    velocity: 0.2
+    volume: 0.01
+    edge: 0.05
+    laplacian: 0.05
+    normal: 0.01
+    control: 0.001
+    slice: 0.5
+training:
+  device: cuda:7
+  seed: 2026
+  epochs: 180
+  shape_epochs: 30
+  motion_epochs: 30
+  batch_size: 4
+  learning_rate: 0.0001
+  joint_min_learning_rate: 0.00001
+  workers: 4
+  cpu_threads: 4
+  validation_cases: 100
+  checkpoint_every_steps: 100
+  save_best: true
+  freeze: none
+  output: outputs/population_ffd_1k_refiner

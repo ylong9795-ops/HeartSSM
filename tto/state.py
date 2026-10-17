@@ -49,6 +49,22 @@ class TTOState:
         self._validate_pose(self.global_transform, ())
         if self.observation_pose is not None:
             self._validate_pose(self.observation_pose, (3,))
+        if self.diagnostics.get('pose_gauge') == 'canonical_identity_global':
+            if not torch.equal(self.global_transform['R'], torch.eye(3, device=self.global_transform['R'].device)) or not torch.equal(
+                    self.global_transform['center_mm'], torch.zeros(3, device=self.global_transform['center_mm'].device)):
+                raise ValueError('S1 canonical pose gauge requires identity global transform')
+        candidate=self.diagnostics.get('s2_candidate',{})
+        if candidate.get('partition_lock_version') == 'regional-only-v1':
+            frozen=candidate['frozen_parameters']
+            if not torch.equal(self.z_shape[:,:32],torch.as_tensor(frozen['global32']).to(self.z_shape)):
+                raise ValueError('S2 Global32 must remain frozen')
+            if not torch.equal(self.z_motion,torch.as_tensor(frozen['motion32']).to(self.z_motion)):
+                raise ValueError('S2 Motion32 must remain frozen; regenerated motion may change')
+            if self.observation_pose is None or any(not torch.equal(value,torch.as_tensor(frozen['pose'][key]).to(value))
+                                                  for key,value in self.observation_pose.items()):
+                raise ValueError('S2 must use the same shared S1 observation poses')
+            if candidate.get('temporary_offsets_used_in_final_mesh') is not False:
+                raise ValueError('S2 chamber offsets are initialization hints only')
         self.stage = Stage(self.stage)
 
     @staticmethod

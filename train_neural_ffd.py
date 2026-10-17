@@ -19,6 +19,10 @@ import math
 from collections import deque
 from functools import partial
 
+from utils.runtime_tmp import configure_local_temporary_directory
+
+configure_local_temporary_directory()
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset, default_collate
@@ -603,7 +607,17 @@ def evaluate_with_runtime(model,dataset,device,*,cases,exact,progress,runtime):
             inference_and_3d_metrics_seconds=compute_seconds,cpu_wait_seconds=wait_seconds,**counters))
 
 
-def main():
+def main(workflow=None):
+    # A separate workflow can reuse the audited loop/data/evaluator without
+    # replacing global functions or changing the original Base-only entry.
+    build = build_model if workflow is None else workflow.build_model
+    load = load_checkpoint if workflow is None else workflow.load_checkpoint
+    save = save_checkpoint if workflow is None else workflow.save_checkpoint
+    configure = configure_trainable if workflow is None else workflow.configure_trainable
+    optimizer_factory = make_optimizer if workflow is None else workflow.make_optimizer
+    objective = compute_objective if workflow is None else workflow.compute_objective
+    evaluator_fn = evaluate if workflow is None else workflow.evaluate
+    candidates_fn = best_checkpoint_candidates if workflow is None else workflow.best_checkpoint_candidates
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=ROOT/'configs/neural_ffd.yaml')
     parser.add_argument('--device')
@@ -638,6 +652,8 @@ def main():
     parser.add_argument('--batch-size',type=int,help='Explicit optimisation batch change; recorded separately from execution tuning')
     parser.add_argument('--profile-steps',type=int,default=0,help='Bounded CPU/CUDA profiler trace; zero disables')
     args = parser.parse_args()
+    if workflow is not None and args.initialize:
+        parser.error('Population training starts from random weights or resumes its own checkpoint; no --initialize')
     if sum(value is not None for value in (args.resume,args.initialize,args.evaluate)) > 1:
         parser.error('--resume, --initialize and --evaluate are mutually exclusive')
     if args.eval_workers<0 or args.eval_cache_cases<1:
@@ -660,15 +676,18 @@ def main():
         if value is not None and value<1:
             raise ValueError('Explicit check limits must be positive')
     output_dir = args.output or repository_path(training['output'])
+    if workflow is not None and not args.resume and not args.evaluate and output_dir.exists():
+        if any((output_dir/name).exists() for name in ('history.jsonl','last.pth','best_joint.pth')):
+            raise ValueError('From-scratch population training requires a fresh output directory')
     output_dir.mkdir(parents=True,exist_ok=True)
     validation = dataset_from_config(data_config,args.split if args.evaluate else 'val')
     if args.evaluate:
-        model,saved = load_checkpoint(args.evaluate,device)
+        model,saved = load(args.evaluate,device)
         if (model.template_sha256!=validation.template_sha256 or model.asset_sha256!=validation.asset_sha256
                 or model.norm_to_mm!=validation.norm_to_mm):
             raise ValueError('Evaluation dataset differs from checkpoint geometry')
         with ValidationRuntime(args.eval_workers,args.eval_cache_cases) as evaluator:
-            report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],
+            report = evaluator_fn(model,validation,device,cases=args.val_cases or training['validation_cases'],
                               exact=args.exact,progress=True,runtime=evaluator)
         report.update(checkpoint_sha256=_sha256(args.evaluate),split=args.split,
                       summary=validation_summary(report))
@@ -688,18 +707,18 @@ def main():
         runtime['batch_size'] = batch_size
     epoch,offset,step = 0,0,0
     if args.resume:
-        model,saved = load_checkpoint(args.resume,device)
+        model,saved = load(args.resume,device)
         if saved['config']!=config or saved['data_identity']!=identity or saved['runtime']!=runtime:
             raise ValueError('Strict resume requires identical config, dataset and training subset/stage')
         epoch,offset,step = saved['epoch'],saved['sample_offset'],saved['step']
     else:
-        model = build_model(train,config).to(device)
+        model = build(train,config).to(device)
         if args.initialize:
             initialization = initialize_from_checkpoint(model,args.initialize,identity)
             (output_dir/'initialization.json').write_text(json.dumps(initialization,indent=2)+'\n')
     (output_dir/'config.yaml').write_text(yaml.safe_dump(config,sort_keys=False))
-    configure_trainable(model,training)
-    optimizer = make_optimizer(model,training)
+    configure(model,training)
+    optimizer = optimizer_factory(model,training)
     if args.resume:
         optimizer.load_state_dict(saved['optimizer'])
         restore_rng(saved,device)
@@ -722,6 +741,8 @@ def main():
         while epoch<training['epochs']:
             epoch_start = time.perf_counter()
             stage = args.stage or stage_for_epoch(epoch,config)
+            if workflow is not None:
+                workflow.set_stage(model,stage)
             if stage == 'joint':
                 joint_start = 0 if args.stage == 'joint' else training['shape_epochs']+training['motion_epochs']
                 progress = (epoch-joint_start)/max(1, training['epochs']-joint_start-1)
@@ -752,7 +773,7 @@ def main():
                     io_seconds += io_wait
                     batch = to_device(batch,device,non_blocking=torch.device(device).type=='cuda')
                     optimizer.zero_grad(set_to_none=True)
-                    decoded,losses,slices = compute_objective(model,batch,criterion,slicer,stage)
+                    decoded,losses,slices = objective(model,batch,criterion,slicer,stage)
                     with torch.profiler.record_function('joint/backward'):
                         losses['total'].backward()
                     finite_gradients = [torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None]
@@ -834,7 +855,7 @@ def main():
                     next_epoch,next_offset = (epoch+1,0) if offset==count else (epoch,offset)
                     stopping = args.max_steps is not None and step>=args.max_steps
                     if stopping or step%training['checkpoint_every_steps']==0:
-                        save_checkpoint(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
+                        save(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
                             epoch=next_epoch,sample_offset=next_offset,step=step,runtime=runtime)
                     if stopping:
                         break
@@ -844,9 +865,9 @@ def main():
             if complete:
                 epoch,offset = epoch+1,0
             if not stopping:
-                save_checkpoint(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
+                save(output_dir/'last.pth',model,optimizer,config=config,identity=identity,
                                 epoch=epoch,sample_offset=offset,step=step,runtime=runtime)
-            report = evaluate(model,validation,device,cases=args.val_cases or training['validation_cases'],
+            report = evaluator_fn(model,validation,device,cases=args.val_cases or training['validation_cases'],
                               exact=args.exact,progress=True,runtime=evaluator)
             summary = dict(epoch=epoch_number,step=step,stage=stage,complete=complete,
                 train_mean_loss=loss_sum/loss_samples,train_samples=loss_samples,
@@ -854,9 +875,9 @@ def main():
             summary['learning_rate'] = rate
             summary['optimizer_group_learning_rates'] = [group['lr'] for group in optimizer.param_groups]
             if training.get('save_best',False):
-                for name,candidate in best_checkpoint_candidates(summary).items():
+                for name,candidate in candidates_fn(summary).items():
                     if name not in best or candidate['score']<best[name]['score']:
-                        save_checkpoint(output_dir/(name+'.pth'),model,optimizer,config=config,identity=identity,
+                        save(output_dir/(name+'.pth'),model,optimizer,config=config,identity=identity,
                             epoch=epoch,sample_offset=offset,step=step,runtime=runtime)
                         best[name] = dict(candidate,epoch=epoch_number,step=step,
                                           validation=summary['validation'])

@@ -78,7 +78,7 @@ class ScaffoldTests(unittest.TestCase):
     def test_unimplemented_stage_fails_before_model_or_output_and_cli_is_nonzero(self):
         pipeline = TTOPipeline(self.config)
         with patch.object(pipeline, 'load_prior', side_effect=AssertionError('unexpected model load')):
-            for stage in ('global_alignment', 'chamber_candidates', 'shape', 'motion', 'joint'):
+            for stage in ('shape', 'motion', 'joint'):
                 with self.assertRaises(NotImplementedError):
                     pipeline.run(['patient'], stage=stage)
         self.assertFalse((self.root / 'result').exists())

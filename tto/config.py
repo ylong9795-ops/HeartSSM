@@ -76,7 +76,11 @@ def validate_config(config):
         _number(loss[name], name)
     if sum(loss[name] for name in ('dice_weight', 'bce_weight', 'boundary_weight')) <= 0:
         raise ValueError('At least one 2D loss component must be active')
-    _keys(config['alignment'], ('chamber_mode',), 'alignment')
+    _keys(config['alignment'], ('chamber_mode', 'pose', 'regional'), 'alignment')
+    from .alignment.config import validate_pose_config
+    validate_pose_config(config['alignment']['pose'])
+    from .alignment.s2_config import validate_s2_config
+    validate_s2_config(config['alignment']['regional'])
     if config['alignment']['chamber_mode'] != 'initial_candidates_only':
         raise ValueError('Chamber translations may only generate initial candidates')
     _keys(config['runtime'], ('device', 'threads', 'seed'), 'runtime')

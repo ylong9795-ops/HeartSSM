@@ -1,8 +1,9 @@
 """Frozen adapter that retains every condition returned by the original encoder."""
 import torch
+import yaml
 
 from train_neural_ffd import load_checkpoint
-from .io import device_tree, model_digest, sha256
+from .io import ROOT, device_tree, model_digest, sha256
 
 
 class FrozenNeuralFFDPrior:
@@ -21,6 +22,28 @@ class FrozenNeuralFFDPrior:
     @property
     def device(self):
         return self.model.template_vertices_mm.device
+
+    def audit_preprocessing(self, data):
+        """Compare to the data configuration named by this same checkpoint."""
+        from data.mask_transform import CHAMBERS, VIEWS
+        path = ROOT / self.saved['config']['data_config']
+        synthetic = yaml.safe_load(path.read_text())
+        mask, source = synthetic['mask'], synthetic['data']
+        checks = dict(
+            views=source['views'] == list(VIEWS), chambers=source['chambers'] == list(CHAMBERS),
+            phases=source['expected_phases'] == data['frames'] == 24 and source['remove_duplicate_endpoint'],
+            model_size=mask['target_size'] == data['model_size'],
+            canonical_fov_mm=mask['canonical_fov_mm'] == data['canonical_fov_mm'],
+            sdf_mm=mask['use_sdf'] and not mask['sdf_normalize'],
+            sdf_clip_mm=mask['sdf_clip_mm'] == data['sdf_clip_mm'] == self.model.encoder.sdf_scale_mm,
+            no_clipping=mask['allow_clipping'] is False)
+        if not all(checks.values()):
+            raise ValueError(f'Real/pretrained preprocessing mismatch: {checks}')
+        return dict(checks=checks, data_config=str(path), data_config_sha256=sha256(path),
+            provenance='Checkpoint names this data config but does not embed its historical content hash; current file audited.',
+            source_reference='synthetic source frame 0; not independently selected clinical ED',
+            sdf='clipped physical mm, negative inside / positive outside; invalid channels zero',
+            encoder_scaling='original encoder divides SDF by sdf_scale_mm exactly once')
 
     @torch.no_grad()
     def encode(self, observations):
@@ -45,6 +68,14 @@ class FrozenNeuralFFDPrior:
         encoded = self.encode(observations)
         conditions = self.conditions(encoded)
         output = self.decode_original(encoded['z_shape'], encoded['z_motion'], conditions)
+        for key, shape in (('z_shape', (observations['masks'].shape[0], 64)),
+                           ('z_motion', (observations['masks'].shape[0], 32))):
+            if encoded[key].shape != shape or not torch.isfinite(encoded[key]).all():
+                raise AssertionError(f'Invalid original encoder {key}')
+        if output['vertices_4d'].shape != (observations['masks'].shape[0], 24, 10631, 3):
+            raise AssertionError('Original decoder must return all 24 fixed-topology frames')
+        if not torch.isfinite(output['vertices_4d']).all():
+            raise AssertionError('Nonfinite original decoder trajectory')
         reference = self.decode_shape(encoded['z_shape'], conditions)
         # Check the unmodified forward independently, including all conditions.
         direct = self.model(device_tree(observations, self.device))

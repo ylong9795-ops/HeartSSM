@@ -28,6 +28,47 @@ loss:
   target_mode: binary_native_v1
 alignment:
   chamber_mode: initial_candidates_only
+  pose:
+    initial_pose_file: configs/real_tto_prior_calibration.json
+    initial_pose_sha256: 4e798bc8a8412a6301e0479819d69fed457f157a5024de0f7d8d2733a56a4cf6
+    source_min_weight: 0.5
+    huber_delta_mm: 3.0
+    coarse_depth_span_mm: 40.0
+    coarse_depth_step_mm: 10.0
+    coarse_tilt_deg: 25.0
+    coarse_roll_deg: 20.0
+    capture_quantiles: [0.1, 0.3, 0.5, 0.7, 0.9]
+    refinement_steps: [{depth_mm: 8.0, angle_deg: 8.0}, {depth_mm: 3.0, angle_deg: 3.0}]
+    retain_candidates: 3
+    beam_width: 3
+    coarse_cells_per_chamber: 2
+    max_evaluations_per_view: 800
+    max_seconds_per_view: 180.0
+  regional:
+    steps: 24
+    priority_steps: 6
+    learning_rate: 0.08
+    seed_scales: [0.0, 0.5, 1.0]
+    pixel_stride: 4
+    chunk_size: 256
+    sigma_mm: 1.0
+    center_scale_mm: 10.0
+    missing_center_penalty: 10.0
+    weights: {center: 1.0, boundary_mm: 0.2, dice: 1.0, anatomy: 1.0}
+    edge_prior_weight: 1.0
+    normal_prior_weight: 1.0
+    av_prior_weight: 0.2
+    surface_prior_weight: 0.01
+    latent_prior_weight: 0.02
+    huber_delta_mm: 3.0
+    hint_ridge: 0.001
+    observable_singular_ratio: 0.001
+    max_hint_mm: 10.0
+    latent_fit_ridge: 0.1
+    native_dice_regression_tolerance: 0.005
+    minimum_dice_gain: 0.0001
+    geometry_timeout_seconds: 90.0
+    max_seconds_per_case: 300.0
 runtime:
   device: cpu
   threads: 4

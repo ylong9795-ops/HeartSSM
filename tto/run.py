@@ -17,6 +17,9 @@ def main(argv=None):
     parser.add_argument('--data-root')
     parser.add_argument('--output-dir')
     parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--initialization-root', help='S0 output root to import frozen original initial meshes for S1')
+    parser.add_argument('--alignment-root', help='S1 output root to import canonical plane poses for S2')
+    parser.add_argument('--workers', type=int, default=1, help='CPU processes for independent S1 cases')
     parser.add_argument('--state', help='New-schema state file, for --stage validate')
     parser.add_argument('--describe', action='store_true', help='Print stage implementation status and exit')
     args = parser.parse_args(argv)
@@ -36,7 +39,12 @@ def main(argv=None):
                 config['data']['root'] = args.data_root
             if args.output_dir:
                 config['output']['root'] = args.output_dir
-            report = TTOPipeline(config).run(args.patients, stage=args.stage, resume=args.resume)
+            if args.initialization_root and args.stage != 'global_alignment':
+                raise ValueError('--initialization-root is only valid for S1 global_alignment')
+            if args.alignment_root and args.stage != 'chamber_candidates':
+                raise ValueError('--alignment-root is only valid for S2 chamber_candidates')
+            report = TTOPipeline(config).run(args.patients, stage=args.stage, resume=args.resume,
+                initialization_root=args.initialization_root, alignment_root=args.alignment_root, workers=args.workers)
         print(json.dumps(jsonable(report), indent=2, ensure_ascii=False))
         return 1 if report.get('failures') else 0
     except (ValueError, NotImplementedError, FileNotFoundError) as error:

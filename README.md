@@ -391,6 +391,62 @@ four-case loss difference was 2.38e-7 and gradient difference relative to the
 global gradient peak was 1.03e-5. This larger-batch result is an engineering
 throughput test, not evidence of identical convergence to batch 1.
 
+## Train Base + Refiner from scratch on the complete 1K split
+
+```bash
+CUDA_VISIBLE_DEVICES=7 RESUME_CHECKPOINT= BATCH_SIZE=4 CNN_CHUNK_SIZE=144 \
+  bash scripts/train_population_ffd_1k.sh
+```
+
+This is the full population architecture, not the frozen-Base pilot below.
+`train_population_ffd.py` reuses the original data/training/validation loop via
+`PopulationWorkflow`: random Base initialization, Shape30, Motion30 and
+Joint120 epochs. Shape/Motion train Base; Joint updates **both** Base and the
+shared Refiner, including physical residual extraction in the graph. Inputs
+are recomputed from the current Base each update; there is no frozen prediction
+or observation-feature cache. Both networks belong to the same Adam from the
+start, so the stage transition does not omit Refiner parameters. Joint adds
+the residual spatial/velocity/acceleration regularizers to its final-mesh loss.
+
+The launcher defaults to physical GPU7 (logical cuda:0), batch4, CNN chunk144,
+no CNN recomputation and the validated batched geometric objective. It pins a
+copy of the code/config under a fresh `outputs/population_ffd_1k_fromscratch_*`
+directory; fixed source assets/manifests are shared by symlink. Existing runs
+are not overwritten. `launch.json` records source hashes and initialization.
+The split remains TRAIN800/VAL100/TEST100. Every epoch evaluates all100 VAL
+patients, including Native Exact; Joint also reports the same Base and final
+predictions with chamber/right-heart tails. TEST is evaluated after training.
+
+Checkpoints embed both networks, complete Adam, RNG, stage, epoch and sample
+offset. Resume with the original output directory and source snapshot:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 RUN_OUTPUT=/absolute/path/to/run \
+  RESUME_CHECKPOINT=/absolute/path/to/run/last.pth \
+  bash scripts/train_population_ffd_1k.sh
+```
+
+Keep the saved batch/schedule when resuming. The new entry rejects inherited
+Base-only/frozen-pilot checkpoints. It saves `best_joint`, `best_dice` and
+`best_tail` separately; `best_tail` prioritizes fewer VAL cells below0.98,
+then higher minimum Dice. Final VAL/TEST use this VAL-selected checkpoint.
+They include Base/final Native and GT comparisons. By default, complete final
+geometry audits check every selected split case: all24 saved surfaces, source
+AV-cap policy and all linear vertex chords including23->0; composed Jacobians
+are sampled separately. This does not certify the entire continuous spatial
+field or arbitrary neural trajectories. Existing CGAL/IPC dependencies are
+exposed through `GEOMETRY_SITE`; `GEOMETRY_WORKERS=8` is the default. Setting
+`GEOMETRY_FINAL=0` explicitly skips those final audits, which leaves geometry
+acceptance incomplete. `PREPARE_ONLY=1` only creates the source/config snapshot.
+
+Multiprocessing scratch defaults to local `/tmp/heartssm-$UID`, overriding
+inherited `TMPDIR`/`TEMP`/`TMP` that may point to NAS. An explicit
+`HEARTFFD_TMPDIR` can select another writable local disk. This avoids NFS
+`.nfs*` busy-file errors at worker shutdown; checkpoints remain in the output
+directory. The launcher also sets this environment when resuming an older
+source snapshot. Already-running processes retain their original environment;
+there is no automatic restart or deletion of live IPC files.
+
 ## Start a shared Refiner Joint from an existing epoch
 
 `train_joint_refiner.py` starts a **new experiment** from an existing original
